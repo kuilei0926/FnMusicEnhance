@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "FnMusicEnhance.main": {
+      "title": "飞牛音乐增强",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "http",
+      "port": "38200",
+      "url": "/",
+      "allUsers": true,
+      "noDisplay": true
+    }
+  }
+}

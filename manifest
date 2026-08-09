@@ -1,0 +1,13 @@
+appname      = FnMusicEnhance
+version      = 1.0.0
+display_name = 飞牛音乐增强
+desc         = 通过服务端口提供飞牛音乐不存在的接口增强手机APP功能。
+platform     = all
+source       = thirdparty
+maintainer   = kuilei0926
+distributor  = kuilei0926
+
+install_dep_apps = trim.music
+
+service_port = 38200
+ctl_stop     = true

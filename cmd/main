@@ -1,0 +1,129 @@
+#!/bin/bash
+
+LOG_FILE="${TRIM_PKGVAR}/app.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+
+PYTHON=/usr/bin/python3
+APP_DIR="${TRIM_APPDEST}/server"
+PORT="${TRIM_SERVICE_PORT}"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+check_process() {
+    local pid="$1"
+    if [ -z "$pid" ]; then
+        return 1
+    fi
+    kill -0 "$pid" 2>/dev/null
+}
+
+status_app() {
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
+        if [ -n "$pid" ] && check_process "$pid"; then
+            return 0
+        fi
+        # stale pidfile
+        rm -f "$PID_FILE"
+    fi
+    return 1
+}
+
+start_app() {
+    if status_app; then
+        log_msg "App already running, skip start."
+        return 0
+    fi
+
+    if [ ! -x "$PYTHON" ]; then
+        log_msg "ERROR: $PYTHON not found."
+        echo "系统缺少 python3，无法启动应用。" > "$TRIM_TEMP_LOGFILE"
+        exit 1
+    fi
+
+    if [ ! -d "$APP_DIR" ]; then
+        log_msg "ERROR: $APP_DIR not found."
+        echo "应用文件缺失，无法启动。" > "$TRIM_TEMP_LOGFILE"
+        exit 1
+    fi
+
+    if [ -z "$PORT" ]; then
+        PORT=38200
+    fi
+
+    log_msg "Starting on port $PORT ..."
+
+    cd "$APP_DIR" || exit 1
+    PORT="$PORT" LOG_FILE="$LOG_FILE" \
+        COVER_ROOT="${COVER_ROOT:-/var/apps/trim.music/meta/cover}" \
+        "$PYTHON" server.py >> "$LOG_FILE" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+
+    # wait a moment to catch early startup failures
+    sleep 1
+    if ! check_process "$pid"; then
+        rm -f "$PID_FILE"
+        echo "服务启动失败，请查看应用日志。" > "$TRIM_TEMP_LOGFILE"
+        exit 1
+    fi
+
+    log_msg "Started, pid=$pid"
+    return 0
+}
+
+stop_app() {
+    log_msg "Stopping ..."
+
+    if [ ! -f "$PID_FILE" ]; then
+        log_msg "No pidfile, nothing to stop."
+        return 0
+    fi
+
+    local pid
+    pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
+
+    if [ -z "$pid" ] || ! check_process "$pid"; then
+        rm -f "$PID_FILE"
+        return 0
+    fi
+
+    kill -TERM "$pid" 2>>"$LOG_FILE" || true
+
+    local count=0
+    while check_process "$pid" && [ "$count" -lt 10 ]; do
+        sleep 1
+        count=$((count + 1))
+    done
+
+    if check_process "$pid"; then
+        log_msg "Timeout, sending KILL ..."
+        kill -KILL "$pid" 2>>"$LOG_FILE" || true
+    fi
+
+    rm -f "$PID_FILE"
+    log_msg "Stopped."
+    return 0
+}
+
+case "$1" in
+start)
+    start_app
+    ;;
+stop)
+    stop_app
+    ;;
+status)
+    if status_app; then
+        exit 0
+    fi
+    exit 3
+    ;;
+*)
+    echo "Unknown command: $1" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+    ;;
+esac

@@ -1,0 +1,8 @@
+{
+    "defaults":
+    {
+        "run-as": "root"
+    },
+    "username": "FnMusicEnhance",
+    "groupname": "FnMusicEnhance"
+}

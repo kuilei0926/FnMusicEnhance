@@ -1,0 +1,66 @@
+name: Build FPK and Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install fnpack
+        run: |
+          curl -L -o /tmp/fnpack \
+            https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64
+          chmod +x /tmp/fnpack
+          sudo mv /tmp/fnpack /usr/local/bin/fnpack
+          fnpack --help
+
+      - name: Extract version from manifest
+        id: version
+        run: |
+          # manifest 中 version = x.y.z（键与值间可能有空格）
+          VER="$(grep -E '^[[:space:]]*version[[:space:]]*=' manifest \
+            | head -n1 | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]' | tr -d '\"')"
+          if [ -z "$VER" ]; then
+            echo "无法从 manifest 读取版本号" >&2
+            exit 1
+          fi
+          echo "VERSION=${VER}" >> "$GITHUB_OUTPUT"
+          echo "打包版本: ${VER}"
+
+      - name: Build FPK
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          # 确认打包前文件齐全
+          ls -la manifest config/privilege config/resource app cmd wizard
+          # fnpack 产物生成到当前目录，构建后收集到 dist/
+          mkdir -p dist
+          fnpack build --directory .
+          ls -la *.fpk
+          # 用版本号重命名产物，避免覆盖旧版
+          VER="${{ steps.version.outputs.VERSION }}"
+          for fpk in *.fpk; do
+            base="${fpk%.fpk}"
+            cp "$fpk" "dist/${base}-${VER}.fpk"
+          done
+          ls -la dist/
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          # 版本号来自 manifest；同名 tag 不存在时自动创建，已存在则附加产物
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          files: |
+            dist/*.fpk
+          generate_release_notes: true

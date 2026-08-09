@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# fnpack 打包工具（本地构建用，不提交）
+fnpack.exe
+*.fpk
+
+# 系统文件
+.DS_Store
+Thumbs.db
