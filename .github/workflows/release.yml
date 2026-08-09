@@ -43,6 +43,8 @@ jobs:
       - name: Build FPK
         run: |
           cd "$GITHUB_WORKSPACE"
+          # 打包要求 wizard/ 目录存在；git 不跟踪空目录，这里补建
+          mkdir -p wizard
           # 确认打包前文件齐全
           ls -la manifest config/privilege config/resource app cmd wizard
           # fnpack 产物生成到当前目录，构建后收集到 dist/
