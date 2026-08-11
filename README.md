@@ -15,12 +15,17 @@
 | `POST /music/api/v1/lyric/list` | 歌词回写 |
 | `POST /music/api/v1/cover` | 歌手 / 专辑封面写入 |
 | `POST /music/api/v1/entity` | 歌手 / 专辑改名、创建实体 |
+| `GET /music/api/v1/search/sources` | 数据源平台列表（客户端决定启用哪些） |
+| `POST /music/api/v1/search/songs` | 多平台歌曲搜索（按客户端 `sources` 顺序分组） |
+| `POST /music/api/v1/search/covers` | 封面搜索（扁平列表） |
+| `POST /music/api/v1/search/lyrics` | 歌词获取（原文 + 翻译 + 罗马音） |
 
 对应的手机端（FeiNiuMusic）功能：
 
 - **歌词修改**：读取 / 编辑 / 保存歌词
 - **歌手 / 专辑编辑**：改名、写封面、创建实体
 - **文件夹视图**：按 NAS 目录层级浏览音乐，支持排序、分页、随机播放、递归搜索、CUE 整轨拆分
+- **数据源搜索**：歌曲信息 / 歌词 / 封面一键匹配、批量匹配、播放无歌词自动搜索（数据源在 NAS 侧实现，App 端无需安装插件）
 
 ## 认证
 
@@ -112,7 +117,7 @@ X-API-Key: <user_token.token>
 { "guid": "93c1eb619f0545148591c7f827225aa3", "content": "[00:25.53]不做考虑也没半点犹豫\n..." }
 ```
 
-服务端按 track guid 查 `lyric.stored_guid`，无记录自动新增，写入 `{LYRIC_ROOT}/{stored_guid[:2]}/{stored_guid}`。
+服务端按 track guid 定位曲目，**每次写入重新计算 `stored_guid`（新文件名）**：删除旧歌词文件、更新 `lyric.stored_guid`、写入 `{LYRIC_ROOT}/{stored_guid[:2]}/{stored_guid}`（首次自动新增 lyric 记录）。
 
 ### POST /music/api/v1/cover
 
@@ -131,6 +136,140 @@ X-API-Key: <user_token.token>
 ```json
 { "type": "album", "guid": "<32hex>", "name": "新名称" }
 { "type": "album", "name": "新专辑", "action": "create" }
+```
+
+### GET /music/api/v1/search/sources
+
+数据源平台列表。客户端据此决定启用哪些平台及顺序。
+
+**响应** `data`：
+
+```json
+{ "sources": [
+  { "id": "netease", "name": "网易云音乐",
+    "capabilities": ["searchSongs", "searchCovers", "getLyrics"],
+    "searchTypes": { "song": 1, "artist": 100, "album": 10 }, "defaultSearchType": 1, "config": {} },
+  { "id": "qq", "name": "QQ音乐", "capabilities": ["searchSongs", "searchCovers", "getLyrics"], "searchTypes": { "song": 0, "artist": 0, "album": 0 }, "defaultSearchType": 0, "config": {} }
+] }
+```
+
+### POST /music/api/v1/search/songs
+
+多平台歌曲搜索。**结果分组顺序 = 请求 `sources` 数组顺序**（后端不自行定序，排序由客户端决定）。
+
+**请求体**：
+
+```json
+{ "keyword": "晴天 周杰伦", "page": 1, "pageSize": 20,
+  "sources": ["netease", "qq", "kugou"], "sort": "default" }
+```
+
+- `sources`：启用的平台 id 数组，**顺序即返回分组顺序**；缺省 = 全部平台；`[]` = 返回空
+- `sort`：组内排序，`default`（平台返回顺序）| `duration_asc` | `duration_desc` | `title_asc` | `title_desc`
+- 单平台失败静默跳过，不影响其他平台
+
+**响应** `data`：
+
+```json
+{ "groups": [ {
+    "pluginId": "netease", "pluginName": "网易云音乐",
+    "items": [ { "id": "2652820720", "title": "晴天", "artist": "周杰伦", "album": "叶惠美",
+        "duration": 269000, "date": "2003-07-31", "trackNumber": "3", "discNumber": "",
+        "picUrl": "https://...jpg", "fields": {}, "internal": { "netease_id": "2652820720" } } ] } ],
+  "total": 4 }
+```
+
+### POST /music/api/v1/search/covers
+
+封面搜索，扁平列表。请求体：
+
+```json
+{ "keyword": "周杰伦", "searchType": 1, "sources": ["qq"], "pageSize": 5 }
+```
+
+`searchType`：0=歌曲 1=歌手 2=专辑。响应 `data`：
+
+```json
+{ "items": [ { "id": "97773", "title": "晴天", "picUrl": "https://...jpg", "pluginId": "qq", "pluginName": "QQ音乐" } ] }
+```
+
+### POST /music/api/v1/search/lyrics
+
+歌词获取。请求体：
+
+```json
+{ "platform": "netease", "songId": "2652820720", "title": "晴天", "artist": "周杰伦", "album": "叶惠美", "duration": 269000,
+  "convert": "simplifiedToTraditional", "removeBlankLines": true,
+  "filterRules": ["作词", "来源 QQ音乐"] }
+```
+
+可选**客户端偏好参数**（服务端对 structured 歌词应用后返回）：
+- `convert`：简繁转换，`none`（默认）| `simplifiedToTraditional` | `traditionalToSimplified`
+- `removeBlankLines`：移除空行（默认 `false`）
+- `filterRules`：非歌词内容过滤规则数组，命中任一规则的行被删除
+
+响应 `data` 返回 **structured 行/词数组**（Lyrico 交换格式，`original` 行可带词级时间戳）+ 行级 LRC 降级文本（是否合并 / 渲染成逐字由客户端决定）：
+
+```json
+{ "platform": "qq", "type": "structured",
+  "original": [ [0, 2250, [ [0, 160, "晴"], [160, 320, "天"], [320, 480, " "] ] ], [2250, 4000, "故事的小黄花"] ],
+  "translated": [ [0, 2250, "原文对应译文"] ],
+  "romanization": [],
+  "rawPlainLrc": "[00:00.00]晴天 - 周杰伦\n...",
+  "tags": { "ti": "晴天", "ar": "周杰伦", "al": "叶惠美" } }
+```
+
+- `original[][2]` 为**词级数组** `[wordStartMs, wordEndMs, "词"]` 时该行带逐字时间戳；为字符串时为行级
+- `translated` / `romanization` 始终为行级 `[startMs, endMs, "文本"]`
+- 平台逐字能力：QQ（QRC 3DES）、酷狗（KRC XOR）、汽水（timed-lyrics）带逐字；网易云（YRC 需登录，匿名降级行级）、Apple（第三方多数行级）
+- 未知 `platform` 或该平台不支持歌词 → 400
+
+### POST /music/api/v1/match/batch
+
+**批量匹配**（服务端全自动处理）：为一批歌曲自动搜索 → 取首个候选（autoConfirm）→ 自动写入歌手 / 歌词 / 专辑 / 封面 / 曲目元数据。
+
+**请求体**：
+
+```json
+{ "songs": [
+    { "guid": "87ad4ed5...", "title": "孤雏", "artist": "AGA", "album": "Ginadoll Concert Live", "duration": 293336, "filePath": "/Music/xxx.flac" }
+  ],
+  "sources": ["netease", "qq", "kugou"],
+  "wants": ["title", "artist", "album", "year", "trackNumber", "cover", "lyrics"],
+  "writeMode": "fill",
+  "preferFilename": false,
+  "lyricOptions": { "convert": "none", "removeBlankLines": true, "filterRules": ["作词"] } }
+```
+
+- `songs[].guid` 必填；`filePath` 供 `preferFilename` 时构造关键词
+- `wants`：要匹配的字段（默认 `["title","artist","album"]`；`cover`/`lyrics` 额外处理）
+- `writeMode`：`fill`（仅空值）/ `overwrite`
+- 服务端处理：歌手/专辑按名字查库幂等（不存在自动创建）、重建 `track_artist`、歌词重新计算 `stored_guid`（删除旧文件）、封面下载后重新计算 `cover_guid`（删除旧文件）
+
+**响应** `data`：
+
+```json
+{ "results": [ { "guid": "...", "matched": true, "matchedTitle": "孤雏",
+    "matchedArtist": "AGA", "matchedAlbum": "孤雏",
+    "fieldsUpdated": ["album_id"], "lyricsUpdated": true, "coverUpdated": true,
+    "artistGuids": ["e2b62531..."], "albumGuid": "42a3c4bf...", "error": null } ] }
+```
+
+### POST /music/api/v1/match/refresh-all-songs
+### POST /music/api/v1/match/refresh-artist-covers
+### POST /music/api/v1/match/refresh-album-covers
+
+**批量刷新（高危全量操作）**，请求体均可含 `sources`（平台 id 数组）：
+
+- `refresh-all-songs`：遍历音乐库全部歌曲，逐一搜索并自动写入（同 `/match/batch` 参数：`wants`/`writeMode`/`lyricOptions`/`preferFilename`）
+- `refresh-artist-covers`：遍历全部歌手，搜索头像并替换（**新 cover_guid，删除旧封面文件**）
+- `refresh-album-covers`：遍历全部专辑，搜索封面并替换（**新 cover_guid，删除旧封面文件**）
+
+**响应** `data`：
+
+```json
+{ "total": 480, "success": 450, "failed": 30,
+  "results": [ { "guid": "...", "name": "AGA", "updated": true, "error": null } ] }
 ```
 
 ## 配置

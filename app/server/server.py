@@ -33,6 +33,14 @@ import tempfile
 import uuid
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from search import aggregate, sources
+from match import (
+    batch_match,
+    refresh_all_songs,
+    refresh_artist_covers,
+    refresh_album_covers,
+)
+
 # ---------------------------------------------------------------------------
 # 配置项（由 cmd/main 通过环境变量注入）
 # ---------------------------------------------------------------------------
@@ -53,6 +61,14 @@ LYRIC_PATH = "/music/api/v1/lyric/list"
 COVER_PATH = "/music/api/v1/cover"
 ENTITY_PATH = "/music/api/v1/entity"
 FOLDER_PATH = "/music/api/v1/folder/list"
+SEARCH_SOURCES_PATH = "/music/api/v1/search/sources"
+SEARCH_SONGS_PATH = "/music/api/v1/search/songs"
+SEARCH_COVERS_PATH = "/music/api/v1/search/covers"
+SEARCH_LYRICS_PATH = "/music/api/v1/search/lyrics"
+MATCH_BATCH_PATH = "/music/api/v1/match/batch"
+MATCH_REFRESH_SONGS_PATH = "/music/api/v1/match/refresh-all-songs"
+MATCH_REFRESH_ARTIST_COVERS_PATH = "/music/api/v1/match/refresh-artist-covers"
+MATCH_REFRESH_ALBUM_COVERS_PATH = "/music/api/v1/match/refresh-album-covers"
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -142,7 +158,11 @@ def _read_json_body(req):
 # ---------------------------------------------------------------------------
 
 def _lookup_stored_guid(track_guid):
-    """查询已有的歌词记录。返回 (stored_guid, track_id, need_insert, error)。"""
+    """查询 track 与已有歌词记录。返回 (track_id, old_stored_guid, error)。
+
+    old_stored_guid 为 None 表示无歌词记录（首次写入）；有值表示旧歌词文件标识，
+    写入时删除旧文件并重新计算。
+    """
     sql = (
         "SELECT l.stored_guid, t.id AS track_id "
         "FROM track t "
@@ -159,50 +179,20 @@ def _lookup_stored_guid(track_guid):
             conn.close()
     except sqlite3.Error as e:
         log("数据库查询失败 guid=%s: %s" % (track_guid, e))
-        return None, None, None, "数据库查询失败"
+        return None, None, "数据库查询失败"
 
     if not row:
-        return None, None, None, "未找到对应的曲目记录"
+        return None, None, "未找到对应的曲目记录"
 
     track_id = row["track_id"]
     stored_guid_raw = row["stored_guid"]
-
+    old = None
     if stored_guid_raw:
-        stored_guid = stored_guid_raw.strip().lower()
-        if not GUID_RE.match(stored_guid):
-            log("stored_guid 格式异常: %s" % stored_guid)
-            return None, None, None, "歌词记录标识格式异常"
-        # 已有歌词记录
-        return stored_guid, track_id, False, None
-
-    # 有 track 但无 lyric 记录，需要新增
-    return None, track_id, True, None
-
-
-def _insert_lyric(track_id):
-    """新增歌词记录。返回 (stored_guid, error)。"""
-    new_guid = uuid.uuid4().hex
-    stored_guid = uuid.uuid4().hex
-    sql = (
-        "INSERT INTO lyric (id, guid, track_id, source, stored_guid, created_at, updated_at) "
-        "VALUES ("
-        "  (SELECT COALESCE(MAX(id), 0) + 1 FROM lyric),"
-        "  ?, ?, 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP"
-        ")"
-    )
-    try:
-        conn = _db_connect()
-        try:
-            conn.execute(sql, (new_guid, track_id, stored_guid))
-            conn.commit()
-        finally:
-            conn.close()
-    except sqlite3.Error as e:
-        log("插入歌词记录失败 track_id=%s: %s" % (track_id, e))
-        return None, "插入歌词记录失败"
-
-    log("新增歌词记录 track_id=%s stored_guid=%s" % (track_id, stored_guid))
-    return stored_guid, None
+        old = stored_guid_raw.strip().lower()
+        if not GUID_RE.match(old):
+            log("stored_guid 格式异常: %s" % old)
+            return None, None, "歌词记录标识格式异常"
+    return track_id, old, None
 
 
 def _update_timestamps(track_id):
@@ -280,6 +270,52 @@ def _write_lyric(stored_guid, text):
             except OSError:
                 pass
         return "歌词写入失败"
+    return None
+
+
+def _remove_lyric_file(stored_guid):
+    """删除旧歌词文件（写入新歌词时清理）。失败仅记录，不影响写入。"""
+    path = os.path.join(LYRIC_ROOT, stored_guid[:2], stored_guid)
+    try:
+        if os.path.exists(path):
+            os.unlink(path)
+            log("删除旧歌词文件 %s" % path)
+    except OSError as e:
+        log("删除旧歌词文件失败 %s: %s" % (path, e))
+
+
+def _set_lyric_stored_guid(track_id, new_guid):
+    """把 lyric 记录的 stored_guid 更新为新值（无记录则新增）。返回 error。
+
+    每次写入重新计算 stored_guid（新文件名），DB 指向新文件。
+    """
+    try:
+        conn = _db_connect()
+        try:
+            row = conn.execute(
+                "SELECT id FROM lyric WHERE track_id = ? LIMIT 1", (track_id,)
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE lyric SET stored_guid = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE track_id = ?",
+                    (new_guid, track_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO lyric (id, guid, track_id, source, stored_guid, "
+                    "created_at, updated_at) VALUES ("
+                    "  (SELECT COALESCE(MAX(id), 0) + 1 FROM lyric),"
+                    "  ?, ?, 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP"
+                    ")",
+                    (uuid.uuid4().hex, track_id, new_guid),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        log("歌词记录更新失败 track_id=%s: %s" % (track_id, e))
+        return "歌词记录更新失败"
     return None
 
 
@@ -489,7 +525,7 @@ def _handle_entity(req):
 
 
 def _handle_post(req):
-    """歌词回写。返回 (code, err, data)。"""
+    """歌词回写。每次写入重新计算 stored_guid（新文件），删除旧歌词文件。返回 (code, err, data)。"""
     payload, code, err = _read_json_body(req)
     if code != 0:
         return code, err, None
@@ -504,23 +540,29 @@ def _handle_post(req):
     if err:
         return 400, err, None
 
-    # 查询数据库：已有记录取 stored_guid，无记录标记需新增
-    stored_guid, track_id, need_insert, err = _lookup_stored_guid(track_guid)
+    # 查询 track_id 与旧歌词文件标识
+    track_id, old_guid, err = _lookup_stored_guid(track_guid)
     if err:
         log("guid=%s 查询失败: %s" % (track_guid, err))
         return 400, err, None
 
-    # 无歌词记录时，新增一行
-    if need_insert:
-        stored_guid, err = _insert_lyric(track_id)
-        if err:
-            log("guid=%s track_id=%s 新增失败: %s" % (track_guid, track_id, err))
-            return 500, err, None
+    # 重新计算新的 stored_guid（新文件名，删除旧的路径）
+    new_guid = uuid.uuid4().hex
 
-    # 以 stored_guid 为文件名写入歌词
-    err = _write_lyric(stored_guid, text)
+    # 更新 DB：lyric 表 stored_guid 指向新文件（无记录则新增）
+    err = _set_lyric_stored_guid(track_id, new_guid)
     if err:
-        log("guid=%s stored_guid=%s 写入失败: %s" % (track_guid, stored_guid, err))
+        log("guid=%s track_id=%s 更新歌词记录失败: %s" % (track_guid, track_id, err))
+        return 500, err, None
+
+    # 删除旧歌词文件（若有）
+    if old_guid and old_guid != new_guid:
+        _remove_lyric_file(old_guid)
+
+    # 写新文件
+    err = _write_lyric(new_guid, text)
+    if err:
+        log("guid=%s stored_guid=%s 写入失败: %s" % (track_guid, new_guid, err))
         return 500, err, None
 
     # 写入成功，更新 track 和 lyric 的 updated_at
@@ -530,8 +572,8 @@ def _handle_post(req):
         return 500, err, None
 
     log("guid=%s stored_guid=%s 歌词已写入 (%d 字节)%s" % (
-        track_guid, stored_guid, len(text.encode("utf-8")),
-        " [新增]" if need_insert else ""
+        track_guid, new_guid, len(text.encode("utf-8")),
+        " [新增]" if not old_guid else " [更新]"
     ))
     return 0, None, None
 
@@ -852,6 +894,174 @@ def _handle_folder(req):
 
 
 # ---------------------------------------------------------------------------
+# 数据源搜索（search 包，移植 musicdl）
+# ---------------------------------------------------------------------------
+
+def _int_field(payload, key, default):
+    try:
+        return int(payload.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _handle_search_sources(req):
+    """GET /music/api/v1/search/sources - 可用平台列表。"""
+    if not _authenticate(req):
+        return 401, "unauthorized", None
+    return 0, None, {"sources": sources.list_sources()}
+
+
+def _handle_search_songs(req):
+    """POST /music/api/v1/search/songs - 多平台歌曲搜索（按客户端排序聚合）。"""
+    payload, code, err = _read_json_body(req)
+    if code != 0:
+        return code, err, None
+    keyword = payload.get("keyword")
+    if not isinstance(keyword, str) or not keyword.strip():
+        return 400, "keyword 不能为空", None
+    req_sources = payload.get("sources")
+    if req_sources is not None and not isinstance(req_sources, list):
+        return 400, "sources 必须是数组", None
+    page = max(_int_field(payload, "page", 1), 1)
+    page_size = min(max(_int_field(payload, "pageSize", 20), 1), 50)
+    sort = payload.get("sort", "default")
+    if not isinstance(sort, str):
+        sort = "default"
+    groups, total = aggregate.search_songs(
+        keyword.strip(), req_sources, page=page, page_size=page_size, sort=sort)
+    return 0, None, {"groups": groups, "total": total}
+
+
+def _handle_search_covers(req):
+    """POST /music/api/v1/search/covers - 封面搜索（扁平列表）。"""
+    payload, code, err = _read_json_body(req)
+    if code != 0:
+        return code, err, None
+    keyword = payload.get("keyword")
+    if not isinstance(keyword, str) or not keyword.strip():
+        return 400, "keyword 不能为空", None
+    req_sources = payload.get("sources")
+    if req_sources is not None and not isinstance(req_sources, list):
+        return 400, "sources 必须是数组", None
+    search_type = _int_field(payload, "searchType", 0)
+    page = max(_int_field(payload, "page", 1), 1)
+    page_size = min(max(_int_field(payload, "pageSize", 10), 1), 50)
+    items = aggregate.search_covers(
+        keyword.strip(), req_sources, search_type=search_type,
+        page=page, page_size=page_size)
+    return 0, None, {"items": items}
+
+
+def _handle_search_lyrics(req):
+    """POST /music/api/v1/search/lyrics - 歌词获取。"""
+    payload, code, err = _read_json_body(req)
+    if code != 0:
+        return code, err, None
+    platform = payload.get("platform")
+    if not isinstance(platform, str) or not platform:
+        return 400, "platform 不能为空", None
+    song_id = payload.get("songId") or payload.get("id") or ""
+    internal = payload.get("internal")
+    song = {
+        "songId": song_id,
+        "id": song_id,
+        "title": payload.get("title") or "",
+        "artist": payload.get("artist") or "",
+        "album": payload.get("album") or "",
+        "duration": _int_field(payload, "duration", 0),
+        "internal": internal if isinstance(internal, dict) else {},
+    }
+    # 客户端歌词偏好：简繁转换 / 移除空行 / 过滤规则
+    convert = payload.get("convert") or "none"
+    if convert not in ("none", "simplifiedToTraditional", "traditionalToSimplified"):
+        convert = "none"
+    remove_blank = bool(payload.get("removeBlankLines", False))
+    filter_rules = payload.get("filterRules")
+    if not isinstance(filter_rules, list):
+        filter_rules = None
+    data = aggregate.get_lyrics(
+        platform, song,
+        convert=convert,
+        remove_blank_lines=remove_blank,
+        filter_rules=filter_rules,
+    )
+    if data is None:
+        return 400, "该平台不支持歌词", None
+    return 0, None, data
+
+
+def _handle_match_batch(req):
+    """POST /music/api/v1/match/batch - 批量匹配（服务端全自动写入）。
+
+    请求体：{ songs: [{guid, title, artist, album, duration, filePath}],
+              sources, wants, writeMode, preferFilename, lyricOptions }
+    """
+    payload, code, err = _read_json_body(req)
+    if code != 0:
+        return code, err, None
+    songs = payload.get("songs")
+    if not isinstance(songs, list) or not songs:
+        return 400, "songs 不能为空", None
+    for s in songs:
+        if not isinstance(s, dict) or not s.get("guid"):
+            return 400, "每首歌曲需含 guid", None
+    sources = payload.get("sources")
+    if sources is not None and not isinstance(sources, list):
+        return 400, "sources 必须是数组", None
+    wants = payload.get("wants")
+    if wants is not None and not isinstance(wants, list):
+        return 400, "wants 必须是数组", None
+    write_mode = payload.get("writeMode", "fill")
+    if write_mode not in ("fill", "overwrite"):
+        return 400, "writeMode 必须是 fill 或 overwrite", None
+    prefer_filename = bool(payload.get("preferFilename", False))
+    lyric_options = payload.get("lyricOptions")
+    if lyric_options is not None and not isinstance(lyric_options, dict):
+        lyric_options = None
+    results = batch_match(
+        songs,
+        sources=sources,
+        lyric_options=lyric_options,
+        wants=wants,
+        write_mode=write_mode,
+        prefer_filename=prefer_filename,
+    )
+    return 0, None, {"results": results}
+
+
+def _handle_refresh(req, kind):
+    """批量刷新（高危全量操作）：songs / artist-covers / album-covers。"""
+    payload, code, err = _read_json_body(req)
+    if code != 0:
+        return code, err, None
+    sources = payload.get("sources")
+    if sources is not None and not isinstance(sources, list):
+        return 400, "sources 必须是数组", None
+    if kind == "songs":
+        wants = payload.get("wants")
+        if wants is not None and not isinstance(wants, list):
+            return 400, "wants 必须是数组", None
+        write_mode = payload.get("writeMode", "fill")
+        if write_mode not in ("fill", "overwrite"):
+            return 400, "writeMode 必须是 fill 或 overwrite", None
+        lyric_options = payload.get("lyricOptions")
+        if lyric_options is not None and not isinstance(lyric_options, dict):
+            lyric_options = None
+        data = refresh_all_songs(
+            sources=sources,
+            lyric_options=lyric_options,
+            wants=wants,
+            write_mode=write_mode,
+            prefer_filename=bool(payload.get("preferFilename", False)),
+        )
+    elif kind == "artist-covers":
+        data = refresh_artist_covers(sources=sources)
+    else:
+        data = refresh_album_covers(sources=sources)
+    return 0, None, data
+
+
+# ---------------------------------------------------------------------------
 # HTTP 处理器
 # ---------------------------------------------------------------------------
 
@@ -883,6 +1093,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._respond_code(code, err, data)
             return
 
+        if self.command == "GET" and path == SEARCH_SOURCES_PATH:
+            code, err, data = _handle_search_sources(self)
+            self._respond_code(code, err, data)
+            return
+
         if self.command != "POST":
             self._respond(405, {"code": 405, "msg": "method not allowed", "data": None})
             return
@@ -893,6 +1108,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             code, err, data = _handle_cover(self)
         elif path == ENTITY_PATH:
             code, err, data = _handle_entity(self)
+        elif path == SEARCH_SONGS_PATH:
+            code, err, data = _handle_search_songs(self)
+        elif path == SEARCH_COVERS_PATH:
+            code, err, data = _handle_search_covers(self)
+        elif path == SEARCH_LYRICS_PATH:
+            code, err, data = _handle_search_lyrics(self)
+        elif path == MATCH_BATCH_PATH:
+            code, err, data = _handle_match_batch(self)
+        elif path == MATCH_REFRESH_SONGS_PATH:
+            code, err, data = _handle_refresh(self, "songs")
+        elif path == MATCH_REFRESH_ARTIST_COVERS_PATH:
+            code, err, data = _handle_refresh(self, "artist-covers")
+        elif path == MATCH_REFRESH_ALBUM_COVERS_PATH:
+            code, err, data = _handle_refresh(self, "album-covers")
         else:
             self._respond(404, {"code": 404, "msg": "not found", "data": None})
             return
