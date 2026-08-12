@@ -5,7 +5,6 @@ PID_FILE="${TRIM_PKGVAR}/app.pid"
 
 PYTHON=/usr/bin/python3
 APP_DIR="${TRIM_APPDEST}/server"
-PORT="${TRIM_SERVICE_PORT}"
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
@@ -50,14 +49,16 @@ start_app() {
         exit 1
     fi
 
-    if [ -z "$PORT" ]; then
-        PORT=38200
-    fi
+    log_msg "Starting (unix socket $SOCK_PATH) ..."
 
-    log_msg "Starting on port $PORT ..."
+    SOCK_PATH="${SOCK_PATH:-/var/run/fnmusic_enhance.sock}"
+    log_msg "Ensuring nginx conf (SOCK_PATH=$SOCK_PATH) ..."
+    LOG_FILE="$LOG_FILE" SOCK_PATH="$SOCK_PATH" \
+        "$PYTHON" "$APP_DIR/nginx_setup.py" >> "$LOG_FILE" 2>&1 \
+        || log_msg "nginx_setup 执行失败(不影响应用启动)"
 
     cd "$APP_DIR" || exit 1
-    PORT="$PORT" LOG_FILE="$LOG_FILE" \
+    LOG_FILE="$LOG_FILE" SOCK_PATH="$SOCK_PATH" \
         COVER_ROOT="${COVER_ROOT:-/var/apps/trim.music/meta/cover}" \
         "$PYTHON" server.py >> "$LOG_FILE" 2>&1 &
     local pid=$!

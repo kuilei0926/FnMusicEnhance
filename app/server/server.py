@@ -30,6 +30,7 @@ import sqlite3
 import socketserver
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -47,8 +48,8 @@ from playlist_import import import_playlist
 # 配置项（由 cmd/main 通过环境变量注入）
 # ---------------------------------------------------------------------------
 
-PORT = int(os.environ.get("PORT", "38200"))
 LOG_FILE = os.environ.get("LOG_FILE", "/var/apps/FnMusicEnhance/var/app.log")
+SOCK_PATH = os.environ.get("SOCK_PATH", "")   # unix socket 路径(nginx 代理用, 必填)
 LYRIC_ROOT = os.environ.get("LYRIC_ROOT", "/var/apps/trim.music/meta/lyric")
 COVER_ROOT = os.environ.get("COVER_ROOT", "/var/apps/trim.music/meta/cover")
 MUSIC_DB = os.environ.get("MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db")
@@ -1140,6 +1141,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log("%s - %s" % (self.address_string(), fmt % args))
 
+    def address_string(self):
+        # unix socket 下 client_address 是路径字符串而非 (host, port), 需兼容
+        addr = getattr(self, "client_address", None)
+        if isinstance(addr, tuple):
+            return super().address_string()
+        return str(addr) if addr else "-"
+
     def _respond(self, status, payload, content_type="application/json"):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -1233,20 +1241,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.do_GET()
 
 
-class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    """unix socket 版 HTTP 服务器(与官方 trim_music 同款)。"""
     daemon_threads = True
     allow_reuse_address = True
 
 
 def main():
-    log("服务启动，监听端口 %d" % PORT)
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    sock = os.environ.get("SOCK_PATH", "")
+    if not sock:
+        log("未配置 SOCK_PATH，无法监听")
+        return 1
+
+    if os.path.exists(sock):
+        try:
+            os.unlink(sock)          # 清理上次遗留的 socket 文件
+        except OSError:
+            pass
     try:
-        server.serve_forever()
+        srv = ThreadingUnixHTTPServer(sock, Handler)
+        os.chmod(sock, 0o666)        # 让 nginx 的 www-data 能连接
+    except Exception as e:
+        log("unix socket 启动失败: %s" % e)
+        return 1
+
+    log("服务启动，监听 unix socket %s" % sock)
+    try:
+        srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
+        srv.server_close()
+    return 0
 
 
 if __name__ == "__main__":
