@@ -1,9 +1,9 @@
 # FnMusicEnhance · 飞牛音乐增强
 
-通过服务端口为飞牛音乐（trim.music）提供其原生不存在的接口，增强手机 App 功能。
+通过 nginx(`/music-enhance/` 路径 → unix socket)为飞牛音乐（trim.music）提供其原生不存在的接口，增强手机 App 功能。
 
 - 仅依赖 Python 标准库（无第三方依赖）
-- 监听 `38200` 端口
+- 监听 unix socket `/var/run/fnmusic_enhance.sock`(经 nginx `/music-enhance/` 对外)
 - 依赖应用：`trim.music`
 
 ## 功能
@@ -276,7 +276,7 @@ X-API-Key: <user_token.token>
 
 | 环境变量 | 说明 | 默认 |
 | --- | --- | --- |
-| `PORT` | 监听端口 | `38200` |
+| `SOCK_PATH` | unix socket 路径(nginx 代理用) | `/var/run/fnmusic_enhance.sock` |
 | `LOG_FILE` | 日志文件 | `/var/apps/FnMusicEnhance/var/app.log` |
 | `LYRIC_ROOT` | 歌词存放根目录 | `/var/apps/trim.music/meta/lyric` |
 | `COVER_ROOT` | 封面存放根目录 | `/var/apps/trim.music/meta/cover` |
