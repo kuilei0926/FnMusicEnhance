@@ -428,19 +428,32 @@ def _parse_kuwo(playlist_id):
 # ---------------------------------------------------------------------------
 
 def _find_or_insert_track(conn, song):
-    """按歌名+歌手精确匹配本地有效歌曲；未匹配则插入占位歌曲（失效）。"""
+    """按歌名匹配本地歌曲，复用有效歌曲或历史占位；否则插入占位。
+
+    is_audio_file_deleted=1 的历史占位也要命中复用：用户曾导入歌单后删除，
+    占位 audio_file（path=`placeholder://<标题>`，UNIQUE）仍留在库中；重新
+    导入再次插入会撞 UNIQUE 约束。占位无真实音频，按歌名即可安全复用。
+    """
     rows = conn.execute(
-        "SELECT id FROM track WHERE title = ? "
-        "AND is_audio_file_deleted = 0 AND is_admin_deleted = 0",
+        "SELECT id FROM track WHERE title = ? AND is_admin_deleted = 0",
         (song["title"],),
     ).fetchall()
     target_artist = song["artist"]
+    placeholder_id = None
     for r in rows:
+        row = conn.execute(
+            "SELECT is_audio_file_deleted FROM track WHERE id = ?", (r[0],)
+        ).fetchone()
+        if row and row[0]:
+            placeholder_id = r[0]  # 占位：先记住，最后按歌名兜底复用
+            continue
         artists = _track_artist_names(conn, r[0])
         if artists and target_artist and (
             artists == target_artist or target_artist in artists
         ):
             return r[0]
+    if placeholder_id is not None:
+        return placeholder_id
     return _insert_placeholder_track(conn, song)
 
 
