@@ -30,6 +30,15 @@ COVER_ROOT = os.environ.get("COVER_ROOT", "/var/apps/trim.music/meta/cover")
 
 GUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 _LRC_LINE_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\](.*)")
+_YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
+
+
+def _extract_year(value):
+    """从日期/时间戳字符串提取 4 位年份（如 "2020-01-01" → 2020）；无效返回 None。"""
+    if not value:
+        return None
+    m = _YEAR_RE.search(str(value))
+    return int(m.group(1)) if m else None
 
 
 def _log(msg):
@@ -157,8 +166,8 @@ def _update_track(conn, track_row, patch, artist_ids, album_id, wants,
             _apply("album_id", album_id, current["album_id"]):
         pass
     if "year" in wants:
-        year = patch.get("year")
-        y = int(year) if year and str(year).isdigit() else None
+        # date 可能是 "2020-01-01" 等完整日期，只取 4 位年份
+        y = _extract_year(patch.get("year"))
         _apply("year", y, current["year"])
     if "trackNumber" in wants:
         tn = patch.get("track_no")
