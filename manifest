@@ -1,8 +1,8 @@
 appname      = FnMusicEnhance
-version      = 2.0.1
+version      = 2.0.2
 display_name = 飞牛音乐增强
 desc         = 通过 nginx 提供飞牛音乐不存在的接口增强手机APP功能。
-platform     = x86
+platform     = all
 source       = thirdparty
 maintainer   = kuilei0926
 distributor  = kuilei0926
