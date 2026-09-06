@@ -29,6 +29,11 @@ RESTORE_ZIP = os.environ.get("TRIM_RESTORE_ZIP", "/usr/trim/share/.restore/ng.co
 # recover 模块出错日志格式串, 用于精确定位 key 缓冲区
 PWD_STR = b"archive_read_add_passphrase: %s, key: %s"
 
+# 兜底密码: 在已知 x86-64 飞牛镜像上从 nginx 二进制提取并实测可用的密码。
+# 当本机指令集无法抠取(如 arm64 RK3528A/ophub-fnnas)或抠出的密码无法解压时,
+# 直接用它对 ng.conf.zip 重试, 实现不依赖抠二进制的注入方式。
+FALLBACK_PASSWORD = b"4yXDSVzwVJuMZew2JqmmfMdu"
+
 
 def log(msg):
     line = "[%s] [nginx_setup] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
@@ -257,7 +262,20 @@ def _extract_heuristic(data):
     return out
 
 
+def _extract_candidates(data):
+    """按置信度返回候选密码: [精确法] + [启发式全部] (去重)。"""
+    cands = []
+    pw = _extract_precise(data)
+    if pw:
+        cands.append(pw)
+    for pw in _extract_heuristic(data):
+        if pw not in cands:
+            cands.append(pw)
+    return cands
+
+
 def get_password():
+    """旧接口: 返回第一个候选密码, 无则 None。"""
     if not os.path.exists(NGINX_BIN):
         log("nginx 二进制不存在: %s" % NGINX_BIN)
         return None
@@ -266,16 +284,12 @@ def get_password():
     arch = {EM_X86_64: "x86-64", EM_AARCH64: "AArch64"}.get(
         _elf_machine(data), "unknown")
     log("nginx 二进制架构: %s" % arch)
-    pw = _extract_precise(data)
-    if pw is None:
-        cands = _extract_heuristic(data)
-        if cands:
-            pw = cands[0]
-    if pw is None:
+    cands = _extract_candidates(data)
+    if not cands:
         log("无法从 %s 提取 zip 密码" % NGINX_BIN)
     else:
-        log("已提取 ng.conf.zip 密码")
-    return pw
+        log("已提取 ng.conf.zip 密码候选 %d 个" % len(cands))
+    return cands[0] if cands else None
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +435,29 @@ def _password_valid(zip_path, password):
         return False
 
 
+def _pick_zip_password(zip_path):
+    """确定能解压 zip 的密码:
+    1. 从 nginx 二进制提取候选 (x86-64 lea / arm64 adr-adrp-ldr 精确法 + 启发式), 逐个实测;
+    2. 都不行则尝试兜底密码 FALLBACK_PASSWORD (不依赖抠二进制, 兼容 arm64)。"""
+    if os.path.exists(NGINX_BIN):
+        with open(NGINX_BIN, "rb") as f:
+            data = f.read()
+        arch = {EM_X86_64: "x86-64", EM_AARCH64: "AArch64"}.get(
+            _elf_machine(data), "unknown")
+        log("nginx 二进制架构: %s" % arch)
+        for pw in _extract_candidates(data):
+            if _password_valid(zip_path, pw):
+                return pw
+            log("二进制提取的密码解压失败, 尝试下一个候选")
+    else:
+        log("nginx 二进制不存在, 直接使用兜底密码")
+    if _password_valid(zip_path, FALLBACK_PASSWORD):
+        log("使用兜底密码")
+        return FALLBACK_PASSWORD
+    log("所有候选(含兜底密码)均无法解压 %s" % zip_path)
+    return None
+
+
 def _direct_inject(conf_path, content):
     """zip 方案不可行时: 直接写 conf 文件并重启 nginx。"""
     tmp = conf_path + ".tmp"
@@ -534,24 +571,23 @@ def ensure_nginx_conf():
         return 0
 
     log("%s 不存在, 开始注入 ng.conf.zip" % conf_path)
-    password = get_password()
-    if not password:
-        return 1
 
     if not os.path.exists(RESTORE_ZIP):
         log("ng.conf.zip 不存在: %s" % RESTORE_ZIP)
         return 1
-
-    if not _password_valid(RESTORE_ZIP, password):
-        log("zip 密码不可用, 回退为直接写 conf 文件")
-        content = build_conf_content().encode("utf-8")
-        return 0 if _direct_inject(conf_path, content) else 1
 
     try:
         names = zipfile.ZipFile(RESTORE_ZIP).namelist()
     except Exception as e:
         log("读取 ng.conf.zip 失败: %s" % e)
         return 1
+
+    password = _pick_zip_password(RESTORE_ZIP)
+    if not password:
+        # 二进制候选 + 兜底密码都无法解压: 直接写 conf 文件并重启(不依赖 zip)
+        log("zip 密码不可用, 回退为直接写 conf 文件")
+        content = build_conf_content().encode("utf-8")
+        return 0 if _direct_inject(conf_path, content) else 1
 
     if ZIP_ENTRY in names:
         log("%s 已在 zip 中, 重启 nginx 释放" % ZIP_ENTRY)
