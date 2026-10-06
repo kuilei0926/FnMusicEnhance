@@ -13,10 +13,18 @@ match - 批量匹配（服务端全自动处理）。
 """
 
 import base64
+import json
+import logging
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import sqlite3
+import sys
 import tempfile
+import threading
+import time
+import traceback
 import uuid
 
 from search import aggregate
@@ -43,6 +51,219 @@ def _extract_year(value):
 
 def _log(msg):
     print("[match] %s" % msg, flush=True)
+
+
+_refresh_logger = None
+_refresh_raw_logger = None
+_refresh_logger_lock = threading.RLock()
+_refresh_log_warned = False
+
+
+def _warn_refresh_log_once(error):
+    """日志故障只警告一次；警告本身也不能影响刷新。"""
+    global _refresh_log_warned
+    try:
+        with _refresh_logger_lock:
+            if _refresh_log_warned:
+                return
+            _refresh_log_warned = True
+        print("[match] WARNING: refresh log 写入失败: %s" % error,
+              file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+class _RefreshLogHandler(RotatingFileHandler):
+    def handleError(self, record):
+        _warn_refresh_log_once(sys.exc_info()[1])
+
+
+def _get_refresh_logger(raw=False):
+    global _refresh_logger, _refresh_raw_logger
+    with _refresh_logger_lock:
+        logger_attr = "_refresh_raw_logger" if raw else "_refresh_logger"
+        logger = globals()[logger_attr]
+        if logger is None:
+            logger = logging.getLogger(
+                "FnMusicEnhance.refresh.raw" if raw else "FnMusicEnhance.refresh")
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+            marker = "_fnmusic_refresh_raw" if raw else "_fnmusic_refresh"
+            if not any(getattr(h, marker, False) for h in logger.handlers):
+                app_log = os.environ.get(
+                    "LOG_FILE", "/var/apps/FnMusicEnhance/var/app.log")
+                default_name = "refresh.raw.log" if raw else "refresh.log"
+                env_name = "REFRESH_RAW_LOG_FILE" if raw else "REFRESH_LOG_FILE"
+                path = os.environ.get(env_name) or os.path.join(
+                    os.path.dirname(app_log), default_name)
+                os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+                handler = _RefreshLogHandler(
+                    path, maxBytes=10 * 1024 * 1024, backupCount=3,
+                    encoding="utf-8", delay=True)
+                handler.setFormatter(logging.Formatter(
+                    "%(message)s" if raw else "%(asctime)s %(message)s",
+                    datefmt="%H:%M:%S"))
+                setattr(handler, marker, True)
+                logger.addHandler(handler)
+            globals()[logger_attr] = logger
+        return logger
+
+
+# Human summary puts the decision and the song/entity first. Raw JSON keeps all fields.
+_TASK_NAMES = {
+    "batch": "多选匹配", "songs": "歌曲刷新",
+    "artist-covers": "歌手图片", "album-covers": "专辑图片",
+    "deployment": "检查",
+}
+_FIELD_NAMES = {
+    "title": "标题", "album_id": "专辑", "artist": "歌手",
+    "year": "年份", "track_no": "音轨序号", "disc_no": "碟片序号",
+}
+_SOURCE_NAMES = {"qq": "QQ音乐", "netease": "网易云", "kugou": "酷狗"}
+_ERROR_NAMES = {
+    "RATE_LIMITED": "请求过于频繁", "HTTP_ERROR": "上游请求失败",
+    "NETWORK_ERROR": "网络连接异常", "TIMEOUT": "请求超时",
+    "PARSE_ERROR": "响应无法解析", "INVALID_RESPONSE": "响应格式异常",
+    "REQUEST_ERROR": "请求异常",
+}
+
+
+def _human_text(value, limit=140):
+    """Sanitize and limit by terminal columns, including full-width characters."""
+    import unicodedata
+    text = " ".join(str(value or "").split())
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cc")
+    out, width = [], 0
+    for ch in text:
+        step = 0 if unicodedata.combining(ch) else (
+            2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1)
+        if width + step > limit:
+            return "".join(out[:-1]) + "…"
+        out.append(ch)
+        width += step
+    return "".join(out)
+
+
+def _human_detail(label, value):
+    """Wrap continuation lines to fit a narrow split terminal."""
+    import unicodedata
+    text = label + _human_text(value)
+    lines, current, width = [], [], 0
+    for ch in text:
+        step = 0 if unicodedata.combining(ch) else (
+            2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1)
+        if width + step > 62:
+            lines.append("  " + "".join(current))
+            current, width = [], 0
+        current.append(ch)
+        width += step
+    if current:
+        lines.append("  " + "".join(current))
+    return "\n".join(lines)
+
+
+def _human_elapsed(seconds):
+    seconds = max(0, int(round(float(seconds or 0))))
+    minutes, remainder = divmod(seconds, 60)
+    return ("%d分%02d秒" % (minutes, remainder)) if minutes else ("%d秒" % seconds)
+
+
+def _refresh_line(payload):
+    """Human display only. All original fields stay in refresh.raw.log."""
+    event = payload.get("event")
+    if event in ("BEGIN", "SONG", "ENTITY"):
+        return None
+    task = str(payload.get("taskId") or "-")[:8]
+    kind = _TASK_NAMES.get(payload.get("taskType"), "任务")
+    prefix = "[%s #%s] " % (kind, task)
+    total = payload.get("total")
+    processed = payload.get("processed", 0)
+    item = "%s/%s" % (payload.get("index", processed), total) if total is not None else str(processed)
+    percent = payload.get("progressPercent")
+    progress = item + (" (%.1f%%)" % float(percent) if percent is not None else "")
+    if event == "START":
+        sources = "、".join(_SOURCE_NAMES.get(x, str(x)) for x in (payload.get("sources") or []))
+        mode = {"fill": "补充空缺", "overwrite": "覆盖更新"}.get(payload.get("writeMode"), "图片更新")
+        return prefix + "开始 · 共%s项" % (total if total is not None else "?") + "\n" + _human_detail(
+            "设置：", "来源 %s；%s" % (sources or "默认", mode))
+    if event == "RESULT":
+        status = payload.get("status")
+        label = {
+            "MATCHED": "成功", "UPDATED": "成功", "WARN": "部分完成",
+            "NO_MATCH": "未匹配", "NO_RESULT": "无结果", "SOURCE_ERROR": "源异常",
+            "EXCEPTION": "处理异常", "FAILED": "失败",
+        }.get(status, "处理完成")
+        title = payload.get("title") or payload.get("name") or "未命名"
+        artist = payload.get("artist")
+        song = str(title) + (" — " + str(artist) if artist else "")
+        lines = [prefix + progress + " · " + label, _human_detail("歌曲：" if artist or payload.get("title") else "名称：", song)]
+        if payload.get("matched"):
+            target_title = payload.get("matchedTitle")
+            target_artist = payload.get("matchedArtist")
+            if target_title and (target_title != payload.get("title") or target_artist != artist):
+                lines.append(_human_detail("匹配：", str(target_title) + (" — " + str(target_artist) if target_artist else "")))
+            fields = payload.get("fieldsUpdated")
+            if fields is not None:
+                names = "、".join(_FIELD_NAMES.get(x, str(x)) for x in fields) if fields else "无"
+                lines.append(_human_detail("更新字段：", names))
+        media = []
+        for field, title in (("lyricsUpdated", "歌词"), ("coverUpdated", "封面")):
+            if payload.get(field) is not None:
+                media.append(title + ("已更新" if payload[field] else "未更新"))
+        source = payload.get("source")
+        if source:
+            media.append("来源 " + _SOURCE_NAMES.get(source, str(source)))
+        if media:
+            lines.append(_human_detail("", "；".join(media)))
+        source_error = payload.get("sourceError")
+        if source_error:
+            description = _ERROR_NAMES.get(source_error, str(source_error))
+            http_status = payload.get("httpStatus")
+            if http_status is not None:
+                description += "（HTTP %s）" % http_status
+            lines.append(_human_detail("错误：", description))
+        elif payload.get("error"):
+            lines.append(_human_detail("错误：", payload["error"]))
+        return "\n".join(lines) + "\n"
+    if event in ("DONE", "PROGRESS"):
+        title = "完成" if event == "DONE" else "进度"
+        line = prefix + title + " " + progress
+        counts = "成功 %s；失败 %s" % (payload.get("success", 0), payload.get("failed", 0))
+        if payload.get("warnings"):
+            counts += "；部分完成 %s" % payload["warnings"]
+        if event == "DONE":
+            counts += "；耗时 " + _human_elapsed(payload.get("elapsedSeconds"))
+        return line + "\n" + _human_detail("统计：", counts) + ("\n" if event == "DONE" else "")
+    if event == "ABORT":
+        return prefix + "任务中止 " + progress + "\n" + _human_detail("错误：", payload.get("error") or payload.get("errorType") or "未知异常") + "\n"
+    if event == "VERIFY":
+        return "[日志检查] 格式已加载"
+    return prefix + _human_text(payload.get("message") or event)
+
+
+def _refresh_log(event, task_id, started, level=logging.INFO, **details):
+    """Write human summary plus complete raw JSON; failures never affect refresh."""
+    try:
+        payload = {"event": event, "taskId": task_id,
+                   "elapsedSeconds": round(time.monotonic() - started, 3)}
+        payload.update(details)
+        if details.get("total") is not None:
+            total = details["total"]
+            payload["progressPercent"] = (
+                round(100.0 * details.get("processed", 0) / total, 1)
+                if total else (100.0 if event == "DONE" else 0.0))
+        try:
+            human_line = _refresh_line(payload)
+            if human_line:
+                _get_refresh_logger().log(level, human_line)
+        except Exception as error:
+            _warn_refresh_log_once(error)
+        raw_payload = dict(payload)
+        raw_payload["timestamp"] = datetime.now().isoformat(timespec="milliseconds")
+        _get_refresh_logger(raw=True).log(
+            level, json.dumps(raw_payload, ensure_ascii=False, separators=(",", ":"), default=str))
+    except Exception as error:
+        _warn_refresh_log_once(error)
 
 
 def _db_connect():
@@ -454,9 +675,11 @@ def _search_first_complete(keyword, sources, wants, page_size=5, timeout=8):
     返回 (candidate, all_flat)；无齐全候选时 candidate 为 None（all_flat 供补充）。
     """
     all_flat = []
+    source_diagnostics = {}
     for platform in sources:
         groups, _total = aggregate.search_songs(
-            keyword, [platform], page=1, page_size=page_size, timeout=timeout
+            keyword, [platform], page=1, page_size=page_size, timeout=timeout,
+            diagnostics=source_diagnostics
         )
         items = []
         for g in groups:
@@ -467,8 +690,8 @@ def _search_first_complete(keyword, sources, wants, page_size=5, timeout=8):
         all_flat.extend(items)
         for item in items:
             if _candidate_complete(item, wants):
-                return item, all_flat  # 第一源齐全即停，不请求后续源
-    return None, all_flat
+                return item, all_flat, source_diagnostics  # 第一源齐全即停，不请求后续源
+    return None, all_flat, source_diagnostics
 
 
 def _complement_candidate(flat, wants):
@@ -551,14 +774,26 @@ def _match_one(conn, song, sources, lyric_options, wants, write_mode,
     if not keyword:
         result["error"] = "无匹配关键词"
         return result
-    candidate, flat = _search_first_complete(keyword, sources, wants)
+    candidate, flat, source_diagnostics = _search_first_complete(keyword, sources, wants)
     if candidate is None:
         # 无单源齐全候选：多源补充（缺失字段从后续平台补）
         candidate = _complement_candidate(flat, wants)
+    failed_sources = {sid: diag for sid, diag in source_diagnostics.items()
+                      if isinstance(diag, dict) and diag.get("status") == "SOURCE_ERROR"}
+    if failed_sources:
+        result["sourceDiagnostics"] = failed_sources
     if candidate is None:
+        result["status"] = "SOURCE_ERROR" if failed_sources else "NO_MATCH"
         result["error"] = "未匹配到候选"
+        if failed_sources:
+            source, diag = next(iter(failed_sources.items()))
+            result.update({"source": source, "sourceError": diag.get("errorType"),
+                           "sourceReason": diag.get("reason"),
+                           "httpStatus": diag.get("httpStatus")})
         return result
 
+    result["status"] = "MATCHED"
+    result["source"] = candidate.get("_platform")
     result["matchedTitle"] = candidate.get("title") or ""
     result["matchedArtist"] = candidate.get("artist") or ""
     result["matchedAlbum"] = candidate.get("album") or ""
@@ -640,41 +875,82 @@ def _album_guid(conn, album_id):
 
 def batch_match(songs, sources=None, lyric_options=None, wants=None,
                 write_mode="fill", prefer_filename=False, auto_confirm=True):
-    """批量匹配。返回结果列表。
-
-    - songs: [{guid, title, artist, album, duration, filePath, ...}]
-    - sources: 启用的平台 id 列表（顺序即优先级）
-    - wants: 要匹配的字段集合（title/artist/album/year/trackNumber/discNumber/cover/lyrics）
-    - write_mode: fill（仅空值）/ overwrite
-    - auto_confirm: 自动取第一个候选（服务端处理，无需确认）
-    """
-    if sources is None:
-        sources = list(SOURCE_REGISTRY.keys())
-    if wants is None:
-        wants = {"title", "artist", "album"}
-    wants = set(wants)
+    """匹配客户端多选歌曲，并写入与全库刷新相同的任务日志。"""
+    task_id = uuid.uuid4().hex
+    started = time.monotonic()
+    requested = list(songs or [])
+    valid_songs = [song for song in requested if isinstance(song, dict)]
+    total = len(valid_songs)
+    progress = {"taskType": "batch", "index": 0, "total": total,
+                "processed": 0, "success": 0, "failed": 0,
+                "errors": 0, "warnings": 0}
+    song_info = {}
+    _refresh_log("BEGIN", task_id, started, **progress,
+                 requestedCount=len(requested), skippedInvalid=len(requested) - total,
+                 writeMode=write_mode, autoConfirm=auto_confirm)
+    conn = None
     results = []
-    conn = _db_connect()
     try:
-        for song in songs or []:
-            if not isinstance(song, dict):
-                continue
+        if sources is None:
+            sources = list(SOURCE_REGISTRY.keys())
+        if wants is None:
+            wants = {"title", "artist", "album"}
+        wants = set(wants)
+        _refresh_log("START", task_id, started, **progress, sources=sources,
+                     wants=list(wants), writeMode=write_mode,
+                     autoConfirm=auto_confirm)
+        conn = _db_connect()
+        for index, song in enumerate(valid_songs, 1):
+            progress["index"] = index
+            song_info = {"guid": song.get("guid") or "",
+                         "title": song.get("title") or "",
+                         "artist": song.get("artist") or ""}
+            _refresh_log("SONG", task_id, started, **progress, **song_info)
+            exception_trace = None
             try:
                 r = _match_one(conn, song, sources, lyric_options, wants,
                                write_mode, prefer_filename)
                 results.append(r)
-            except Exception as e:  # noqa: BLE001 单首失败不中断批量
-                _log("匹配失败 %s: %s" % (song.get("guid"), e))
-                results.append({
-                    "guid": song.get("guid") or "",
-                    "matched": False,
-                    "error": str(e),
-                })
-            # 每首后提交：释放写锁（飞牛音乐服务可能同时写库，避免长时间占用）
+            except Exception as error:  # noqa: BLE001 单首失败不中断批量
+                results.append({"guid": song.get("guid") or "", "matched": False,
+                                "status": "EXCEPTION", "error": str(error)})
+                exception_trace = traceback.format_exc()
+            # Preserve the existing per-song commit boundary.
             conn.commit()
+            r = results[-1]
+            matched = bool(r.get("matched"))
+            error_text = r.get("error")
+            progress["processed"] += 1
+            progress["success"] += int(matched)
+            progress["failed"] += int(not matched)
+            progress["errors"] += int(bool(error_text))
+            progress["warnings"] += int(matched and bool(error_text))
+            status = r.get("status") or ("MATCHED" if matched else "NO_MATCH")
+            if matched and error_text:
+                status = "WARN"
+            level = logging.ERROR if exception_trace else (
+                logging.WARNING if error_text or not matched else logging.INFO)
+            _refresh_log(
+                "RESULT", task_id, started, level=level, **progress, **song_info,
+                status=status, matched=r.get("matched"), source=r.get("source"),
+                sourceError=r.get("sourceError"), sourceReason=r.get("sourceReason"),
+                httpStatus=r.get("httpStatus"), fieldsUpdated=r.get("fieldsUpdated"),
+                lyricsUpdated=r.get("lyricsUpdated"), coverUpdated=r.get("coverUpdated"),
+                matchedTitle=r.get("matchedTitle"), matchedArtist=r.get("matchedArtist"),
+                matchedAlbum=r.get("matchedAlbum"), error=error_text,
+                traceback=exception_trace)
+            if progress["processed"] % 10 == 0:
+                _refresh_log("PROGRESS", task_id, started, **progress)
+        _refresh_log("DONE", task_id, started, **progress)
+        return results
+    except BaseException as error:
+        _refresh_log("ABORT", task_id, started, level=logging.ERROR,
+                     **progress, **song_info, error=str(error),
+                     errorType=type(error).__name__, traceback=traceback.format_exc())
+        raise
     finally:
-        conn.close()
-    return results
+        if conn is not None:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -704,46 +980,100 @@ def refresh_all_songs(sources=None, lyric_options=None, wants=None,
     高危操作：对音乐库全部歌曲逐首搜索+写入，耗时较长。返回
     {total, success, failed, results}。
     """
-    if sources is None:
-        sources = list(SOURCE_REGISTRY.keys())
-    if wants is None:
-        wants = {"title", "artist", "album"}
-    wants = set(wants)
-    conn = _db_connect()
-    conn.row_factory = sqlite3.Row
-    results = []
+    task_id = uuid.uuid4().hex
+    started = time.monotonic()
+    progress = {"taskType": "songs", "index": 0, "total": None, "processed": 0,
+                "success": 0, "failed": 0, "errors": 0, "warnings": 0}
+    song_info = {}
+    _refresh_log("BEGIN", task_id, started, **progress,
+                 writeMode=write_mode, preferFilename=prefer_filename)
     try:
-        tracks = conn.execute(
-            "SELECT id, guid, title, album_id FROM track "
-            "WHERE is_audio_file_deleted = 0 AND is_admin_deleted = 0"
-        ).fetchall()
-        for t in tracks:
-            song = {
-                "guid": t["guid"],
-                "title": t["title"] or "",
-                "artist": _track_artist_names(conn, t["id"]),
-                "album": _track_album_name(conn, t["album_id"]),
-                "duration": 0,
-            }
-            try:
-                r = _match_one(conn, song, sources, lyric_options, wants,
-                               write_mode, prefer_filename)
-                results.append(r)
-            except Exception as e:  # noqa: BLE001 单首失败不中断
-                results.append({
-                    "guid": t["guid"], "matched": False, "error": str(e),
-                })
-            # 每首后提交：释放写锁（飞牛音乐服务可能同时写库）
-            conn.commit()
-    finally:
-        conn.close()
-    success = sum(1 for r in results if r.get("matched"))
-    return {
-        "total": len(results),
-        "success": success,
-        "failed": len(results) - success,
-        "results": results,
-    }
+        if sources is None:
+            sources = list(SOURCE_REGISTRY.keys())
+        if wants is None:
+            wants = {"title", "artist", "album"}
+        wants = set(wants)
+        conn = _db_connect()
+        conn.row_factory = sqlite3.Row
+        results = []
+        try:
+            tracks = conn.execute(
+                "SELECT id, guid, title, album_id FROM track "
+                "WHERE is_audio_file_deleted = 0 AND is_admin_deleted = 0"
+            ).fetchall()
+            progress["total"] = len(tracks)
+            _refresh_log("START", task_id, started, **progress,
+                         sources=sources, wants=list(wants),
+                         writeMode=write_mode, preferFilename=prefer_filename)
+            for index, t in enumerate(tracks, 1):
+                progress["index"] = index
+                song_info = {"guid": t["guid"], "title": t["title"] or "",
+                             "artist": None}
+                song = {
+                    "guid": t["guid"],
+                    "title": t["title"] or "",
+                    "artist": _track_artist_names(conn, t["id"]),
+                    "album": _track_album_name(conn, t["album_id"]),
+                    "duration": 0,
+                }
+                song_info["artist"] = song["artist"]
+                _refresh_log("SONG", task_id, started, **progress, **song_info)
+                exception_trace = None
+                try:
+                    r = _match_one(conn, song, sources, lyric_options, wants,
+                                   write_mode, prefer_filename)
+                    results.append(r)
+                except Exception as e:  # noqa: BLE001 单首失败不中断
+                    results.append({
+                        "guid": t["guid"], "matched": False, "status": "EXCEPTION",
+                        "error": str(e),
+                    })
+                    exception_trace = traceback.format_exc()
+                # 每首后提交：释放写锁（飞牛音乐服务可能同时写库）
+                conn.commit()
+                r = results[-1]
+                matched = bool(r.get("matched"))
+                error = r.get("error")
+                progress["processed"] += 1
+                progress["success"] += int(matched)
+                progress["failed"] += int(not matched)
+                # errors 统计带 error 的结果；warnings 是其中 matched=True 的子集。
+                progress["errors"] += int(bool(error))
+                progress["warnings"] += int(matched and bool(error))
+                status = r.get("status") or ("MATCHED" if matched else "NO_MATCH")
+                if matched and error:
+                    status = "WARN"
+                level = logging.ERROR if exception_trace else (
+                    logging.WARNING if error or not matched else logging.INFO)
+                _refresh_log(
+                    "RESULT", task_id, started, level=level,
+                    **progress, **song_info, status=status, matched=r.get("matched"),
+                    source=r.get("source"), sourceError=r.get("sourceError"),
+                    sourceReason=r.get("sourceReason"), httpStatus=r.get("httpStatus"),
+                    fieldsUpdated=r.get("fieldsUpdated"),
+                    lyricsUpdated=r.get("lyricsUpdated"),
+                    coverUpdated=r.get("coverUpdated"),
+                    matchedTitle=r.get("matchedTitle"),
+                    matchedArtist=r.get("matchedArtist"),
+                    matchedAlbum=r.get("matchedAlbum"), error=error,
+                    traceback=exception_trace)
+                if progress["processed"] % 10 == 0:
+                    _refresh_log("PROGRESS", task_id, started, **progress)
+        finally:
+            conn.close()
+        success = sum(1 for r in results if r.get("matched"))
+        _refresh_log("DONE", task_id, started, **progress)
+        return {
+            "total": len(results),
+            "success": success,
+            "failed": len(results) - success,
+            "results": results,
+        }
+    except BaseException as error:
+        _refresh_log("ABORT", task_id, started, level=logging.ERROR,
+                     **progress, **song_info, error=str(error),
+                     errorType=type(error).__name__, traceback=traceback.format_exc())
+        raise
 
 
 def _search_cover_pic(keyword, sources, search_type, timeout=10):
@@ -759,52 +1089,95 @@ def _search_cover_pic(keyword, sources, search_type, timeout=10):
 
 def _refresh_covers(table, entity_type, search_type, sources):
     """通用：遍历歌手/专辑，搜索封面并更新（新 cover_guid + 删旧文件）。"""
-    if sources is None:
-        sources = list(SOURCE_REGISTRY.keys())
-    conn = _db_connect()
-    conn.row_factory = sqlite3.Row
-    results = []
-    try:
-        entities = conn.execute(
-            "SELECT id, guid, name, cover_guid FROM %s" % table
-        ).fetchall()
-        for e in entities:
-            name = (e["name"] or "").strip()
-            entry = {"guid": e["guid"], "name": name, "updated": False,
-                     "error": None}
-            if not name:
-                entry["error"] = "名称为空"
-                results.append(entry)
-                continue
-            try:
-                pic = _search_cover_pic(name, sources, search_type)
-                if not pic:
-                    entry["error"] = "未搜索到封面"
-                    results.append(entry)
-                    continue
-                image = _download_image(pic)
-                if not image:
-                    entry["error"] = "下载封面失败"
-                    results.append(entry)
-                    continue
-                err = _write_entity_cover(conn, table, e["id"], entity_type, image)
-                entry["updated"] = err is None
-                entry["error"] = err
-            except Exception as ex:  # noqa: BLE001 单个失败不中断
-                entry["error"] = str(ex)
-            results.append(entry)
-            # 每个实体后提交：释放写锁（飞牛音乐服务可能同时写库）
-            conn.commit()
-    finally:
-        conn.close()
-    success = sum(1 for r in results if r["updated"])
-    return {
-        "total": len(results),
-        "success": success,
-        "failed": len(results) - success,
-        "results": results,
-    }
+    task_id = uuid.uuid4().hex
+    started = time.monotonic()
+    progress = {"taskType": entity_type + "-covers", "entityType": entity_type,
+                "index": 0, "total": None, "processed": 0,
+                "success": 0, "failed": 0, "errors": 0, "warnings": 0}
+    entity_info = {}
+    _refresh_log("BEGIN", task_id, started, **progress)
 
+    def log_result(entry, exception_trace=None):
+        # Early failures have no writes; successful write attempts are logged after commit.
+        updated = bool(entry["updated"])
+        progress["processed"] += 1
+        progress["success"] += int(updated)
+        progress["failed"] += int(not updated)
+        progress["errors"] += int(bool(entry.get("error")))
+        level = logging.ERROR if exception_trace else (
+            logging.INFO if updated else logging.WARNING)
+        _refresh_log(
+            "RESULT", task_id, started, level=level, **progress, **entity_info,
+            status="UPDATED" if updated else "FAILED", updated=entry["updated"],
+            coverUpdated=entry["updated"], error=entry.get("error"),
+            traceback=exception_trace)
+        if progress["processed"] % 10 == 0:
+            _refresh_log("PROGRESS", task_id, started, **progress)
+
+    try:
+        if sources is None:
+            sources = list(SOURCE_REGISTRY.keys())
+        conn = _db_connect()
+        conn.row_factory = sqlite3.Row
+        results = []
+        try:
+            entities = conn.execute(
+                "SELECT id, guid, name, cover_guid FROM %s" % table
+            ).fetchall()
+            progress["total"] = len(entities)
+            _refresh_log("START", task_id, started, **progress, sources=sources)
+            for index, e in enumerate(entities, 1):
+                progress["index"] = index
+                entity_info = {"guid": e["guid"], "name": e["name"] or ""}
+                name = (e["name"] or "").strip()
+                entity_info["name"] = name
+                _refresh_log("ENTITY", task_id, started, **progress, **entity_info)
+                entry = {"guid": e["guid"], "name": name, "updated": False,
+                         "error": None}
+                if not name:
+                    entry["error"] = "名称为空"
+                    results.append(entry)
+                    log_result(entry)
+                    continue
+                exception_trace = None
+                try:
+                    pic = _search_cover_pic(name, sources, search_type)
+                    if not pic:
+                        entry["error"] = "未搜索到封面"
+                        results.append(entry)
+                        log_result(entry)
+                        continue
+                    image = _download_image(pic)
+                    if not image:
+                        entry["error"] = "下载封面失败"
+                        results.append(entry)
+                        log_result(entry)
+                        continue
+                    err = _write_entity_cover(conn, table, e["id"], entity_type, image)
+                    entry["updated"] = err is None
+                    entry["error"] = err
+                except Exception as ex:  # noqa: BLE001 单个失败不中断
+                    entry["error"] = str(ex)
+                    exception_trace = traceback.format_exc()
+                results.append(entry)
+                # 每个实体后提交：释放写锁（飞牛音乐服务可能同时写库）
+                conn.commit()
+                log_result(entry, exception_trace)
+        finally:
+            conn.close()
+        success = sum(1 for r in results if r["updated"])
+        _refresh_log("DONE", task_id, started, **progress)
+        return {
+            "total": len(results),
+            "success": success,
+            "failed": len(results) - success,
+            "results": results,
+        }
+    except BaseException as error:
+        _refresh_log("ABORT", task_id, started, level=logging.ERROR,
+                     **progress, **entity_info, error=str(error),
+                     errorType=type(error).__name__, traceback=traceback.format_exc())
+        raise
 
 def refresh_artist_covers(sources=None):
     """遍历全部歌手，搜索歌手封面并更新（新 cover_guid + 删旧）。"""
