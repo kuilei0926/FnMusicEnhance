@@ -12,11 +12,16 @@ Lyrico-Plugins/qq/source.js）。
 
 import base64
 import json
+import logging
+import os
 import random
 import re
+import threading
+import time
 import zlib
 
 from .. import net
+from ..qq_device import get_qimei36
 from ..crypto import triple_des_decrypt
 from ..lyric_tools import lrc_to_structured
 
@@ -62,8 +67,83 @@ COMM = {
 SEARCH_TYPE_MAP = {0: 0, 1: 1, 2: 2}
 
 
+class SearchItems(list):
+    """List-compatible result carrying source diagnostics for the aggregator."""
+    def __init__(self, values=(), diagnostic=None):
+        super().__init__(values)
+        self.diagnostic = diagnostic or {}
+
+
+class _QQRateLimiter:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._next_at = 0.0
+        self._backoff_until = 0.0
+        self._consecutive_failures = 0
+
+    def _float_env(self, name, default):
+        try:
+            return max(0.0, float(os.environ.get(name, str(default))))
+        except (TypeError, ValueError):
+            return default
+
+    def wait(self):
+        minimum = self._float_env("QQ_SEARCH_MIN_INTERVAL", 0.8)
+        jitter = self._float_env("QQ_SEARCH_JITTER", 0.3)
+        with self._lock:
+            delay = max(0.0, self._next_at - time.monotonic(),
+                        self._backoff_until - time.monotonic())
+            if delay:
+                time.sleep(delay)
+            # Reserve from the actual release time: concurrent callers cannot
+            # all resume at the same backoff deadline.
+            self._next_at = time.monotonic() + minimum + random.uniform(0.0, jitter)
+
+    def record(self, diagnostic):
+        error_type = (diagnostic or {}).get("errorType")
+        is_error = error_type in {
+            "RATE_LIMITED", "HTTP_ERROR", "NETWORK_ERROR", "TIMEOUT",
+            "REQUEST_ERROR", "PARSE_ERROR", "INVALID_RESPONSE",
+        }
+        with self._lock:
+            if not is_error:
+                self._consecutive_failures = 0
+                return
+            self._consecutive_failures += 1
+            pauses = {3: self._float_env("QQ_BACKOFF_3", 5.0),
+                      5: self._float_env("QQ_BACKOFF_5", 15.0),
+                      10: self._float_env("QQ_BACKOFF_10", 60.0)}
+            pause = pauses.get(self._consecutive_failures)
+            if self._consecutive_failures > 10:
+                pause = pauses[10]
+            if pause is not None:
+                self._backoff_until = max(self._backoff_until, time.monotonic() + pause)
+                net.log_qq_event(
+                    "BACKOFF", level=logging.WARNING,
+                    consecutiveFailures=self._consecutive_failures,
+                    pauseSeconds=pause, errorType=error_type)
+
+
+_QQ_RATE_LIMITER = _QQRateLimiter()
+
+
 def _searchid():
-    return str(10000000000000000 + random.randint(0, 80000000000000000))
+    # Same layout used by musicdl: random high/middle bits plus time-of-day.
+    t = random.randint(1, 20) * 18014398509481984
+    n = random.randint(0, 4194304) * 4294967296
+    r = round(time.time() * 1000) % (24 * 60 * 60 * 1000)
+    return str(t + n + r)
+
+
+def _mask(value):
+    value = str(value or "")
+    return value[:8] + "..." + value[-4:] if value else "-"
+
+
+def _build_comm():
+    common = dict(COMM)
+    common["QIMEI36"] = get_qimei36()
+    return common
 
 
 def _build_cover_url(albummid, size=800):
@@ -73,14 +153,18 @@ def _build_cover_url(albummid, size=800):
 
 
 def _musicu_request(keyword, search_type, page, page_size, timeout):
-    """调用 musicu.fcg 搜索，返回响应 JSON 或 None。"""
+    """调用 musicu.fcg，返回 (module, HTTP/解析诊断)。"""
+    _QQ_RATE_LIMITER.wait()
+    search_id = _searchid()
+    comm = _build_comm()
+    qimei36 = comm["QIMEI36"]
     body = {
-        "comm": dict(COMM),
+        "comm": comm,
         "music.search.SearchCgiService.DoSearchForQQMusicMobile": {
             "module": "music.search.SearchCgiService",
             "method": "DoSearchForQQMusicMobile",
             "param": {
-                "searchid": _searchid(),
+                "searchid": search_id,
                 "query": keyword,
                 "search_type": search_type,
                 "num_per_page": page_size,
@@ -90,14 +174,60 @@ def _musicu_request(keyword, search_type, page, page_size, timeout):
             },
         },
     }
-    data = net.post_json_parsed(
-        MUSICU_URL, json_body=body, headers=HEADERS, timeout=timeout
-    )
+    data, meta = net.post_json_parsed_detailed(
+        MUSICU_URL, json_body=body, headers=HEADERS, timeout=timeout,
+        context={"keyword": keyword, "searchid": search_id,
+                 "searchType": search_type, "qimei36": _mask(qimei36)})
     if not isinstance(data, dict):
-        return None
+        return None, meta
+    if data.get("code") not in (None, 0, "0"):
+        meta = dict(meta)
+        meta.update({"ok": False, "errorType": "INVALID_RESPONSE",
+                     "reason": "QQ search returned API code %s" % data.get("code")})
+        return None, meta
     key = "music.search.SearchCgiService.DoSearchForQQMusicMobile"
     module = data.get(key)
-    return module if isinstance(module, dict) else None
+    if not isinstance(module, dict):
+        meta = dict(meta)
+        meta.update({"ok": False, "errorType": "INVALID_RESPONSE",
+                     "reason": "search module missing"})
+        return None, meta
+    return module, meta
+
+
+def _body_diagnostic(module, meta, body_key, keyword, search_type):
+    diagnostic = {
+        "source": "qq", "keyword": keyword, "searchType": search_type,
+        "httpStatus": (meta or {}).get("httpStatus"),
+        "elapsedMs": (meta or {}).get("elapsedMs"),
+    }
+    if not (meta or {}).get("ok"):
+        diagnostic.update({
+            "status": "SOURCE_ERROR",
+            "errorType": (meta or {}).get("errorType") or "REQUEST_ERROR",
+            "reason": (meta or {}).get("reason"),
+        })
+        return None, diagnostic
+    module_code = module.get("code") if isinstance(module, dict) else None
+    diagnostic["moduleCode"] = module_code
+    if module_code not in (None, 0, "0"):
+        diagnostic.update({"status": "SOURCE_ERROR", "errorType": "INVALID_RESPONSE",
+                           "reason": "QQ search returned module code %s" % module_code})
+        return None, diagnostic
+    data = module.get("data") if isinstance(module, dict) else None
+    body = data.get("body") if isinstance(data, dict) else None
+    if not isinstance(body, dict):
+        diagnostic.update({"status": "SOURCE_ERROR", "errorType": "INVALID_RESPONSE",
+                           "reason": "response body missing"})
+        return None, diagnostic
+    items = body.get(body_key)
+    if not isinstance(items, list):
+        diagnostic.update({"status": "SOURCE_ERROR", "errorType": "INVALID_RESPONSE",
+                           "reason": "%s missing" % body_key})
+        return body, diagnostic
+    diagnostic.update({"status": "MATCHED" if items else "NO_RESULT",
+                       "errorType": None, "itemCount": len(items)})
+    return body, diagnostic
 
 
 def _map_song(item):
@@ -139,28 +269,46 @@ def _songs_from_body(body):
 
 
 def search_songs(keyword, page=1, page_size=20, timeout=None):
-    module = _musicu_request(keyword, 0, page, page_size, timeout)
-    if not module:
-        return []
-    body = (module.get("data") or {}).get("body")
-    if not isinstance(body, dict):
-        return []
-    return _songs_from_body(body)
+    module, meta = _musicu_request(keyword, 0, page, page_size, timeout)
+    body, diagnostic = _body_diagnostic(module, meta, "item_song", keyword, 0)
+    if body is None:
+        items = SearchItems([], diagnostic)
+    else:
+        items = SearchItems(_songs_from_body(body), diagnostic)
+        if diagnostic.get("status") == "MATCHED" and not items:
+            diagnostic.update({"status": "SOURCE_ERROR", "errorType": "INVALID_RESPONSE",
+                               "reason": "item_song contained no valid items"})
+    _QQ_RATE_LIMITER.record(diagnostic)
+    net.log_qq_event("SEARCH", status=diagnostic.get("status"),
+                     errorType=diagnostic.get("errorType"),
+                     httpStatus=diagnostic.get("httpStatus"),
+                     elapsedMs=diagnostic.get("elapsedMs"),
+                     itemCount=diagnostic.get("itemCount"), keyword=keyword)
+    return items
 
 
 def search_covers(keyword, search_type=0, page=1, page_size=5, timeout=None):
     """封面搜索（0=歌曲 1=歌手 2=专辑）。返回 list[dict] 带 picUrl。"""
     stype = SEARCH_TYPE_MAP.get(search_type, 0)
-    module = _musicu_request(keyword, stype, page, page_size, timeout)
-    if not module:
-        return []
-    body = (module.get("data") or {}).get("body")
-    if not isinstance(body, dict):
-        return []
+    module, meta = _musicu_request(keyword, stype, page, page_size, timeout)
+    body_key = "singer" if stype == 1 else ("item_album" if stype == 2 else "item_song")
+    body, diagnostic = _body_diagnostic(module, meta, body_key, keyword, stype)
+    if body is None:
+        _QQ_RATE_LIMITER.record(diagnostic)
+        net.log_qq_event("SEARCH", status=diagnostic.get("status"),
+                         errorType=diagnostic.get("errorType"),
+                         httpStatus=diagnostic.get("httpStatus"),
+                         elapsedMs=diagnostic.get("elapsedMs"), keyword=keyword)
+        return SearchItems([], diagnostic)
     if stype == 1:
         singers = body.get("singer")
         if not isinstance(singers, list):
-            return []
+            diagnostic.update({"status": "SOURCE_ERROR", "errorType": "INVALID_RESPONSE",
+                               "reason": "singer missing"})
+            _QQ_RATE_LIMITER.record(diagnostic)
+            net.log_qq_event("SEARCH", status=diagnostic.get("status"),
+                             errorType=diagnostic.get("errorType"), keyword=keyword)
+            return SearchItems([], diagnostic)
         out = []
         for s in singers:
             mid = s.get("singerMID") or ""
@@ -177,11 +325,19 @@ def search_covers(keyword, search_type=0, page=1, page_size=5, timeout=None):
                 "fields": {},
                 "internal": {},
             })
-        return out
+        _QQ_RATE_LIMITER.record(diagnostic)
+        diagnostic["itemCount"] = len(out)
+        net.log_qq_event("SEARCH", status=diagnostic.get("status"), itemCount=len(out), keyword=keyword)
+        return SearchItems(out, diagnostic)
     if stype == 2:
         albums = body.get("item_album")
         if not isinstance(albums, list):
-            return []
+            diagnostic.update({"status": "SOURCE_ERROR", "errorType": "INVALID_RESPONSE",
+                               "reason": "item_album missing"})
+            _QQ_RATE_LIMITER.record(diagnostic)
+            net.log_qq_event("SEARCH", status=diagnostic.get("status"),
+                             errorType=diagnostic.get("errorType"), keyword=keyword)
+            return SearchItems([], diagnostic)
         out = []
         for al in albums:
             mid = al.get("albummid") or ""
@@ -198,8 +354,18 @@ def search_covers(keyword, search_type=0, page=1, page_size=5, timeout=None):
                 "fields": {},
                 "internal": {},
             })
-        return out
-    return _songs_from_body(body)
+        _QQ_RATE_LIMITER.record(diagnostic)
+        diagnostic["itemCount"] = len(out)
+        net.log_qq_event("SEARCH", status=diagnostic.get("status"), itemCount=len(out), keyword=keyword)
+        return SearchItems(out, diagnostic)
+    out = _songs_from_body(body)
+    diagnostic["itemCount"] = len(out)
+    if diagnostic.get("status") == "MATCHED" and not out:
+        diagnostic.update({"status": "SOURCE_ERROR", "errorType": "INVALID_RESPONSE",
+                           "reason": "item_song contained no valid items"})
+    _QQ_RATE_LIMITER.record(diagnostic)
+    net.log_qq_event("SEARCH", status=diagnostic.get("status"), itemCount=len(out), keyword=keyword)
+    return SearchItems(out, diagnostic)
 
 
 def _parse_qrc(text):
@@ -350,8 +516,11 @@ def _play_lyric_info(song, timeout):
             },
         },
     }
-    data = net.post_json_parsed(MUSICU_URL, json_body=body, headers=HEADERS,
-                                timeout=timeout)
+    _QQ_RATE_LIMITER.wait()
+    data, meta = net.post_json_parsed_detailed(
+        MUSICU_URL, json_body=body, headers=HEADERS, timeout=timeout,
+        context={"operation": "GetPlayLyricInfo", "songId": song_id})
+    _QQ_RATE_LIMITER.record({"errorType": meta.get("errorType") if not meta.get("ok") else None})
     req0 = (data or {}).get("req_0") or {}
     d = req0.get("data")
     if not isinstance(d, dict):
@@ -375,6 +544,7 @@ def _play_lyric_info(song, timeout):
 
 def get_lyrics(song, timeout=None):
     """获取歌词。song: dict（含 songId/id）。GetPlayLyricInfo（QRC 逐字）优先，老接口降级。"""
+    song_id = str(song.get("songId") or song.get("id") or "")
     internal = song.get("internal") if isinstance(song.get("internal"), dict) else {}
     songmid = str(song.get("songmid") or internal.get("songmid") or "")
 
@@ -388,7 +558,8 @@ def get_lyrics(song, timeout=None):
 
     # 降级：老接口 fcg_query_lyric_new（base64 原文 + 译文，行级）
     if songmid:
-        data = net.get_json(
+        _QQ_RATE_LIMITER.wait()
+        data, meta = net.get_json_detailed(
             LYRIC_URL,
             params={
                 "songmid": songmid,
@@ -401,8 +572,8 @@ def get_lyrics(song, timeout=None):
                 "platform": "yqq",
             },
             headers=LYRIC_HEADERS,
-            timeout=timeout,
-        )
+            timeout=timeout, context={"operation": "LegacyLyric", "songId": song_id})
+        _QQ_RATE_LIMITER.record({"errorType": meta.get("errorType") if not meta.get("ok") else None})
         if isinstance(data, dict):
             def _decode(field):
                 raw = data.get(field)

@@ -1078,7 +1078,14 @@ def _handle_match_batch(req):
         write_mode=write_mode,
         prefer_filename=prefer_filename,
     )
-    return 0, None, {"results": results}
+    total = len(results)
+    success = sum(1 for result in results if result.get("matched"))
+    return 0, None, {
+        "total": total,
+        "success": success,
+        "failed": total - success,
+        "results": results,
+    }
 
 
 def _handle_refresh(req, kind):

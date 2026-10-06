@@ -249,11 +249,14 @@ X-API-Key: <user_token.token>
 **响应** `data`：
 
 ```json
-{ "results": [ { "guid": "...", "matched": true, "matchedTitle": "孤雏",
+{ "total": 1, "success": 1, "failed": 0,
+  "results": [ { "guid": "...", "matched": true, "matchedTitle": "孤雏",
     "matchedArtist": "AGA", "matchedAlbum": "孤雏",
     "fieldsUpdated": ["album_id"], "lyricsUpdated": true, "coverUpdated": true,
     "artistGuids": ["e2b62531..."], "albumGuid": "42a3c4bf...", "error": null } ] }
 ```
+
+`total` / `success` / `failed` 让客户端能够区分完整结果、空响应和请求超时；`results` 的顺序不保证与请求顺序相同，客户端应按 `guid` 关联歌曲。
 
 ### POST /music/api/v1/match/refresh-all-songs
 ### POST /music/api/v1/match/refresh-artist-covers
@@ -281,6 +284,27 @@ X-API-Key: <user_token.token>
 | `LYRIC_ROOT` | 歌词存放根目录 | `/var/apps/trim.music/meta/lyric` |
 | `COVER_ROOT` | 封面存放根目录 | `/var/apps/trim.music/meta/cover` |
 | `MUSIC_DB` | 飞牛音乐数据库 | `/usr/local/apps/@appdata/trim.music/db/music.db` |
+| `REFRESH_RAW_LOG_FILE` | 全量/多选任务原始 JSONL 日志 | `LOG_FILE` 同目录下 `refresh.raw.log` |
+| `QQ_HTTP_LOG_FILE` | QQ 请求人读摘要 | `LOG_FILE` 同目录下 `qq-http.log` |
+| `QQ_HTTP_RAW_LOG_FILE` | QQ 请求原始 JSONL 日志 | `LOG_FILE` 同目录下 `qq-http.raw.log` |
+| `QQ_QIMEI_CACHE` | QQ 设备标识缓存 | `LOG_FILE` 同目录下 `qq_device.json` |
+| `QQ_DYNAMIC_QIMEI` | 启用动态 QIMEI；设为 `0` 使用 fallback | `1` |
+| `QQ_SEARCH_MIN_INTERVAL` | QQ 请求最小间隔（秒） | `0.8` |
+| `QQ_SEARCH_JITTER` | 请求间隔随机抖动（秒） | `0.3` |
+| `QQ_BACKOFF_3` / `QQ_BACKOFF_5` / `QQ_BACKOFF_10` | 连续源错误后的等待时间（秒） | `5` / `15` / `60` |
+
+## 运行日志
+
+服务端将人读摘要和完整原始明细分开保存：
+
+```text
+/var/apps/FnMusicEnhance/var/refresh.log       # 全量/多选任务摘要
+/var/apps/FnMusicEnhance/var/refresh.raw.log   # 完整任务 JSONL
+/var/apps/FnMusicEnhance/var/qq-http.log       # QQ 请求摘要
+/var/apps/FnMusicEnhance/var/qq-http.raw.log   # 完整 QQ 请求 JSONL
+```
+
+摘要只显示任务进度、歌曲结果、来源和错误；原始日志保留 URL、searchid、响应状态、耗时、响应大小和完整诊断字段。QQ 请求日志不会记录 Cookie、token 或认证密钥。
 
 ## 构建 / 发布
 

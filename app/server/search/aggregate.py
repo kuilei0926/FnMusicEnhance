@@ -45,7 +45,7 @@ def _sort_items(items, sort):
 
 
 def search_songs(keyword, sources, page=1, page_size=20, sort="default",
-                 timeout=8):
+                 timeout=8, diagnostics=None):
     """按 sources 顺序聚合多平台歌曲搜索。返回 (groups, total)。"""
     if not keyword:
         return [], 0
@@ -60,17 +60,21 @@ def search_songs(keyword, sources, page=1, page_size=20, sort="default",
         try:
             impl = registry[sid]["impl"]
             items = impl.search_songs(keyword, page, page_size, timeout=timeout)
-            return sid, [i for i in items if i.get("id")], None
+            diagnostic = getattr(items, "diagnostic", None) or {"status": "MATCHED" if items else "NO_RESULT"}
+            return sid, [i for i in items if i.get("id")], diagnostic
         except Exception as e:  # noqa: BLE001 单平台失败隔离
             log.warning("平台 %s search_songs 失败: %s", sid, e)
-            return sid, [], None
+            return sid, [], {"source": sid, "status": "SOURCE_ERROR",
+                              "errorType": "EXCEPTION", "reason": str(e)}
 
     groups = []
     total = 0
     with ThreadPoolExecutor(max_workers=len(known)) as pool:
         futures = [pool.submit(_run, sid) for sid in known]
         for fut in futures:
-            sid, items, _err = fut.result()
+            sid, items, diagnostic = fut.result()
+            if diagnostics is not None:
+                diagnostics[sid] = diagnostic
             if not items:
                 continue
             meta = registry[sid]
