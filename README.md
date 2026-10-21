@@ -35,6 +35,8 @@
 X-API-Key: <user_token.token>
 ```
 
+> 若系统开启了「访问码」，请先看[访问码 / 安全码兼容](#访问码--安全码兼容)一节，否则 App 会提示「未检测到增强服务」。
+
 ## 接口文档
 
 统一响应信封：
@@ -306,6 +308,73 @@ X-API-Key: <user_token.token>
 
 摘要只显示任务进度、歌曲结果、来源和错误；原始日志保留 URL、searchid、响应状态、耗时、响应大小和完整诊断字段。QQ 请求日志不会记录 Cookie、token 或认证密钥。
 
+## 访问码 / 安全码兼容
+
+系统「设置 → 安全 → 访问码」开启后，**所有** HTTP 请求（含 `/music-enhance/*`）都要先过 nginx 的 `auth_request` 校验，未通过时返回的不是 401，而是：
+
+```text
+HTTP/1.1 200 OK
+Content-Type: text/html
+<!DOCTYPE html> ... 访问码校验页 ...
+```
+
+因为状态码是 200，手机端解析 JSON 失败后只会提示「**未检测到增强服务**」，不会提示「请输入访问码」，所以从现象上看很容易误判成插件没装好或权限有问题。
+
+### 原因
+
+手机端调用 `/music-enhance/*` 的是 App 内置的 companion HTTP 客户端，它**不共享**访问 `/music/api/v1/*` 时用的登录态 / 访问码凭据。同一个 IP、同一个 UA、同一分钟内可以观察到：
+
+| 请求 | 结果 |
+| --- | --- |
+| `/music/api/v1/static/cover`（带凭据） | 200 + 真实数据 |
+| `/music-enhance/health`（不带凭据） | 200 + 校验页 HTML（约 3~9 KB） |
+
+访问码是 nginx 层的前置校验，服务端（本插件）无法替客户端完成验证，所以只能二选一：
+
+1. 把增强路径加入访问码白名单（下面脚本做的事，立即可用）；
+2. 等客户端在调用 `/music-enhance/*` 时带上访问码凭据（cookie 或 `x-access-code` 头），从根上解决——届时应撤掉白名单。
+
+### 方案一：加入白名单（脚本）
+
+```bash
+sudo ./tools/access_code_whitelist.sh             # 应用（幂等，可重复执行）
+sudo ./tools/access_code_whitelist.sh --check     # 只读检查当前规则与实际效果
+sudo ./tools/access_code_whitelist.sh --rollback  # 从最近一次备份恢复
+```
+
+脚本流程：备份 → 幂等追加两条 `prefix` 规则 → 校正权限 → 重启 `security_service` → 不带凭据实测校验。
+
+写入 `/usr/trim/etc/safe_code_whitelist.conf` 的规则：
+
+```text
+true * * prefix /music-enhance/health        feiniu-music-enhance probe
+true * * prefix /music-enhance/music/api/v1/ feiniu-music-enhance api
+```
+
+刻意**不**写成 `prefix /music-enhance/`，以免将来新增的接口被一并放行；官方 `/music/api/v1/*` 也不放行（它本来就带凭据）。
+
+### 白名单的几个硬约束
+
+这几条踩中任一条，规则都会静默失效：
+
+| 约束 | 说明 |
+| --- | --- |
+| `match_type` 只有 `exact` / `prefix` | 写别的值整行被丢弃 |
+| 文件必须是 `root:root` `644` | 权限不符时**整份**白名单被忽略 |
+| 匹配的是原始 URI | 取自 `X-Original-URI`（即 `$request_uri`，**含 query string**） |
+| `method` 要写 `*` | 除 `/health`、`/music/api/v1/folder/list`、`/music/api/v1/search/sources` 外都是 `POST`，写 `GET` 会漏 |
+| 改完必须重启 `security_service` | 白名单只在进程启动时加载一次，`reload` 无效 |
+| 系统升级可能覆盖 | 升级后用 `--check` 复查 |
+
+### 安全影响
+
+放行后，任何能访问 nginx 端口的人都可以**免访问码**访问这两个前缀：
+
+- 业务接口仍然需要 `X-API-Key`（见[认证](#认证)），访问码少了这一层，但接口鉴权还在；
+- `/health` 本身不鉴权，只返回存活状态与 `data.auth`，不泄露数据。
+
+如果对暴露面敏感，可只在需要的网络环境下开启访问码，或等方案二。
+
 ## 构建 / 发布
 
 打标签 `v*`（或推 `main`）触发 GitHub Actions 自动打包 `.fpk` 并发布：
@@ -336,6 +405,8 @@ FnMusicEnhance/
 │   ├── privilege             # 运行用户（root，需读写 trim.music 数据）
 │   └── resource
 ├── wizard/                   # 安装向导
+├── tools/
+│   └── access_code_whitelist.sh  # 访问码白名单工具（见「访问码 / 安全码兼容」）
 ├── manifest                  # 应用元数据
 ├── ICON.PNG / ICON_256.PNG   # 应用图标
 └── .github/workflows/        # 自动打包发布
