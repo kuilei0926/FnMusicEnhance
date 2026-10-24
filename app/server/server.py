@@ -26,6 +26,7 @@ import http.server
 import json
 import os
 import re
+import shutil
 import sqlite3
 import socketserver
 import sys
@@ -53,6 +54,10 @@ SOCK_PATH = os.environ.get("SOCK_PATH", "")   # unix socket 路径(nginx 代理�
 LYRIC_ROOT = os.environ.get("LYRIC_ROOT", "/var/apps/trim.music/meta/lyric")
 COVER_ROOT = os.environ.get("COVER_ROOT", "/var/apps/trim.music/meta/cover")
 MUSIC_DB = os.environ.get("MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db")
+# 音乐库根目录（音频文件所在）。留空则从 music.db 的 audio_file.path 自动推导。
+MUSIC_ROOT = os.environ.get("MUSIC_ROOT", "")
+# 曲目清理的隔离区（可恢复）。留空则放在音乐库同级的 .fnmusic-trash。
+QUARANTINE_ROOT = os.environ.get("QUARANTINE_ROOT", "")
 
 MAX_BODY_BYTES = 16 * 1024 * 1024   # 含封面 base64（歌词仍受 5MB 文本限制）
 MAX_IMAGE_BYTES = 8 * 1024 * 1024   # 解码后的封面图片字节上限
@@ -73,6 +78,10 @@ MATCH_REFRESH_SONGS_PATH = "/music/api/v1/match/refresh-all-songs"
 MATCH_REFRESH_ARTIST_COVERS_PATH = "/music/api/v1/match/refresh-artist-covers"
 MATCH_REFRESH_ALBUM_COVERS_PATH = "/music/api/v1/match/refresh-album-covers"
 PLAYLIST_IMPORT_PATH = "/music/api/v1/playlist/import"
+# 曲目清理（物理删除 / 移入隔离区）。刻意不叫 track/delete ——
+# 官方后端已有同名的 track/delete（仅置 is_admin_deleted 的软隐藏，文件仍在磁盘上），
+# 用不同路径避免语义混淆。
+TRACK_PURGE_PATH = "/music/api/v1/track/purge"
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -1139,6 +1148,218 @@ def _handle_playlist_import(req):
 
 
 # ---------------------------------------------------------------------------
+# 曲目清理（track/purge）
+#
+# 官方后端的 POST /music/api/v1/track/delete 只是把 track.is_admin_deleted 置 1
+# （软隐藏，音频文件仍留在磁盘上），且官方前端从未绑定该接口 —— 没有可用的删除路径。
+# 绕过界面直接删文件也不行：官方应用只置 audio_file.is_physical_file_deleted，
+# track / album / artist 记录全部残留，库里会积累点不开的幽灵歌。
+#
+# 本接口做的是「物理清理」：文件与数据库记录一并清掉，不留残留。
+# ---------------------------------------------------------------------------
+
+def _derive_music_root(conn):
+    """推导音乐库根目录：环境变量优先，否则取 audio_file.path 的最长公共目录前缀。"""
+    if MUSIC_ROOT:
+        return os.path.realpath(MUSIC_ROOT)
+    rows = conn.execute(
+        "SELECT path FROM audio_file WHERE path IS NOT NULL AND path <> '' LIMIT 2000"
+    ).fetchall()
+    dirs = [os.path.dirname(r[0]) for r in rows]
+    if not dirs:
+        return ""
+    prefix = os.path.commonprefix(dirs)
+    cut = prefix.rfind("/")
+    return prefix[:cut + 1] if cut > 0 else ""
+
+
+def _quarantine_dir(music_root):
+    """隔离区目录：与音乐库同卷的 .fnmusic-trash（同卷移动是原子 rename，速度快）。"""
+    if QUARANTINE_ROOT:
+        return os.path.realpath(QUARANTINE_ROOT)
+    if not music_root:
+        return ""
+    return os.path.join(os.path.dirname(music_root.rstrip("/")), ".fnmusic-trash")
+
+
+def _backup_db(conn):
+    """清理前对 music.db 做一次一致性快照，返回备份路径。"""
+    folder = os.path.dirname(MUSIC_DB)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(folder, "music.db.fnmt-bak-%s" % stamp)
+    dst = sqlite3.connect(path)
+    try:
+        conn.backup(dst)
+    finally:
+        dst.close()
+    # 只保留最近 10 份，避免无限增长
+    try:
+        olds = sorted(
+            (f for f in os.listdir(folder) if f.startswith("music.db.fnmt-bak-")),
+            reverse=True,
+        )
+        for name in olds[10:]:
+            os.remove(os.path.join(folder, name))
+    except OSError:
+        pass
+    return path
+
+
+def _cascade_delete(conn, tids):
+    """级联删除 track 及其全部关联行，返回各表删除行数。"""
+    stat = {}
+    ph = ",".join("?" * len(tids))
+    tabs = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    for tb in tabs:
+        cols = [x[1] for x in conn.execute("PRAGMA table_info(%s)" % tb)]
+        if "track_id" in cols:
+            n = conn.execute("DELETE FROM %s WHERE track_id IN (%s)" % (tb, ph), tids).rowcount
+            if n:
+                stat[tb] = n
+    afids = [r[0] for r in conn.execute(
+        "SELECT audio_file_id FROM track WHERE id IN (%s)" % ph, tids).fetchall()]
+    stat["track"] = conn.execute("DELETE FROM track WHERE id IN (%s)" % ph, tids).rowcount
+    if afids:
+        ph2 = ",".join("?" * len(afids))
+        stat["audio_file"] = conn.execute(
+            "DELETE FROM audio_file WHERE id IN (%s)" % ph2, afids).rowcount
+    # 顺带清掉失去全部曲目的专辑/歌手空壳
+    stat["album"] = conn.execute(
+        "DELETE FROM album WHERE id IN (SELECT id FROM album a WHERE NOT EXISTS("
+        "SELECT 1 FROM track t WHERE t.album_id=a.id))").rowcount
+    stat["artist"] = conn.execute(
+        "DELETE FROM artist WHERE id IN (SELECT id FROM artist a WHERE NOT EXISTS("
+        "SELECT 1 FROM track_artist ta WHERE ta.artist_id=a.id))").rowcount
+    return stat
+
+
+def _track_artists(conn, tid):
+    """取曲目的歌手名（多歌手逗号分隔），用于客户端二次确认展示。"""
+    rows = conn.execute(
+        "SELECT a.name FROM track_artist ta JOIN artist a ON a.id=ta.artist_id "
+        "WHERE ta.track_id=? ORDER BY ta.artist_order", (tid,)).fetchall()
+    return ", ".join(r[0] for r in rows if r[0])
+
+
+def _handle_track_purge(req):
+    """POST /music/api/v1/track/purge - 物理清理曲目（文件 + 数据库记录）。
+
+    请求体：{"guids": ["<32位hex>", ...], "mode": "quarantine" | "purge"}
+      mode 省略时按 quarantine 处理（移入隔离区，可恢复），purge 才是真正删除文件。
+    """
+    payload, code, err = _read_json_body(req)
+    if code != 0:
+        return code, err, None
+
+    guids = payload.get("guids")
+    if isinstance(guids, str):
+        guids = [guids]
+    if not isinstance(guids, list) or not guids:
+        return 400, "guids 不能为空", None
+    if len(guids) > 500:
+        return 400, "单次最多清理 500 首", None
+
+    mode = payload.get("mode") or "quarantine"
+    if mode not in ("quarantine", "purge"):
+        return 400, "mode 只能是 quarantine 或 purge", None
+
+    clean = []
+    for g in guids:
+        if not isinstance(g, str) or not GUID_RE.match(g.strip()):
+            return 400, "guid 格式不合法: %r" % (g,), None
+        clean.append(g.strip().lower())
+
+    conn = _db_connect()
+    try:
+        music_root = _derive_music_root(conn)
+        quar_dir = _quarantine_dir(music_root)
+
+        # 先查出待清理曲目的文件路径（路径只来自数据库，不接受调用方指定）
+        rows = []
+        for g in clean:
+            r = conn.execute(
+                "SELECT t.id, t.title, af.path FROM track t "
+                "LEFT JOIN audio_file af ON af.id = t.audio_file_id "
+                "WHERE t.guid = ?", (g,)).fetchone()
+            if r is None:
+                rows.append((g, None, None, None))
+            else:
+                rows.append((g, r[0], r[1], r[2]))
+
+        # 文件层面处理（先文件后库：文件移走失败就不动数据库）
+        removed = []
+        skipped = []
+        moved = []
+        for g, tid, title, path in rows:
+            if tid is None:
+                skipped.append({"guid": g, "reason": "曲目不存在"})
+                continue
+            item = {"guid": g, "tid": tid, "title": title or "",
+                    "artist": _track_artists(conn, tid)}
+            if not path:
+                # 没有关联音频文件（如纯 CUE 虚拟轨）：没有文件可处理，但库记录照样清
+                removed.append(dict(item, action="db_only"))
+                continue
+            real = os.path.realpath(path)
+            # 双保险：路径来自数据库，但仍校验必须在音乐库目录内
+            if music_root and not (real == music_root or real.startswith(music_root)):
+                skipped.append(dict(item, reason="文件不在音乐库目录内，已拒绝"))
+                continue
+            targets = [real]
+            lrc = os.path.splitext(real)[0] + ".lrc"
+            if os.path.exists(lrc):
+                targets.append(lrc)
+            try:
+                if mode == "quarantine" and quar_dir:
+                    os.makedirs(quar_dir, exist_ok=True)
+                    stamp = time.strftime("%Y%m%d-%H%M%S")
+                    for f in targets:
+                        if not os.path.exists(f):
+                            continue
+                        dest = os.path.join(quar_dir, stamp + "_" + os.path.basename(f))
+                        shutil.move(f, dest)
+                        moved.append({"file": f, "to": dest})
+                else:
+                    for f in targets:
+                        if os.path.exists(f):
+                            os.remove(f)
+            except OSError as e:
+                skipped.append(dict(item, reason="文件处理失败: %s" % e))
+                continue
+            removed.append(dict(item, action=mode))
+    finally:
+        conn.close()
+
+    if not removed:
+        return 0, None, {"removed": [], "skipped": skipped, "moved": [], "backup": ""}
+
+    # 备份后再动数据库
+    conn = _db_connect()
+    try:
+        backup_path = _backup_db(conn)
+        tids = [r["tid"] for r in removed]
+        try:
+            conn.execute("BEGIN")
+            stats = _cascade_delete(conn, tids)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+    log("清理曲目 mode=%s 删除=%d 跳过=%d stats=%s backup=%s" % (
+        mode, len(removed), len(skipped), stats, backup_path))
+    return 0, None, {
+        "removed": removed,
+        "skipped": skipped,
+        "moved": moved,
+        "stats": stats,
+        "backup": backup_path,
+    }
+
+
+# ---------------------------------------------------------------------------
 # HTTP 处理器
 # ---------------------------------------------------------------------------
 
@@ -1208,6 +1429,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             code, err, data = _handle_refresh(self, "album-covers")
         elif path == PLAYLIST_IMPORT_PATH:
             code, err, data = _handle_playlist_import(self)
+        elif path == TRACK_PURGE_PATH:
+            code, err, data = _handle_track_purge(self)
         else:
             self._respond(404, {"code": 404, "msg": "not found", "data": None})
             return

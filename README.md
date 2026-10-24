@@ -19,6 +19,7 @@
 | `POST /music/api/v1/search/songs` | 多平台歌曲搜索（按客户端 `sources` 顺序分组） |
 | `POST /music/api/v1/search/covers` | 封面搜索（扁平列表） |
 | `POST /music/api/v1/search/lyrics` | 歌词获取（原文 + 翻译 + 罗马音） |
+| `POST /music/api/v1/track/purge` | 曲目清理（文件移入隔离区或物理删除 + 清库记录） |
 
 对应的手机端（FeiNiuMusic）功能：
 
@@ -258,6 +259,52 @@ X-API-Key: <user_token.token>
 
 `total` / `success` / `failed` 让客户端能够区分完整结果、空响应和请求超时；`results` 的顺序不保证与请求顺序相同，客户端应按 `guid` 关联歌曲。
 
+### POST /music/api/v1/track/purge
+
+**曲目清理**。飞牛音乐后端虽有 `POST /music/api/v1/track/delete`，但它只把
+`track.is_admin_deleted` 置 1（软隐藏，音频文件仍留在磁盘上），且官方前端从未绑定该接口，
+界面上没有可用的删除路径；绕过界面直接删文件也不行 —— 官方应用只置
+`audio_file.is_physical_file_deleted`，`track` / `album` / `artist` 记录全部残留，
+库里会积累点不开的幽灵歌。本接口做的是**物理清理**：文件与数据库记录一并处理，不留残留。
+
+> 路径刻意不叫 `track/delete`：官方后端已有同名的 `track/delete`（软隐藏），
+> 用不同路径避免语义混淆。
+
+**请求体**：
+
+| 字段 | 说明 | 默认 |
+| --- | --- | --- |
+| `guids` | track guid 数组（32 位 hex），也接受单个字符串 | 必填，单次上限 500 |
+| `mode` | `quarantine` 移入隔离区（**可恢复**）／ `purge` 物理删除文件 | `quarantine` |
+
+**响应** `data`：
+
+| 字段 | 说明 |
+| --- | --- |
+| `removed` | 已清理的曲目（`guid` / `tid` / `title` / `artist` / `action`） |
+| `skipped` | 未处理的条目及原因（`reason`） |
+| `moved` | 被移入隔离区的文件（`file` → `to`），仅 quarantine 模式 |
+| `stats` | 各表删除行数（`track` / `audio_file` / `lyric` / `album` / `artist` …） |
+| `backup` | 本次操作前生成的数据库快照路径 |
+
+`action` 取值：`quarantine`（文件已移入隔离区）／ `purge`（文件已物理删除）／
+`db_only`（该曲目没有关联音频文件，只清了库记录）。
+
+**安全约束**：
+
+- 文件路径**只取自数据库**，不接受调用方指定，避免任意路径写入
+- 额外校验文件 `realpath` 必须在音乐库目录内，越界则跳过并记入 `skipped`
+- 数据库操作前自动生成一致性快照（`music.db.fnmt-bak-<时间戳>`，保留最近 10 份）
+- 顺带清理失去全部曲目的专辑 / 歌手空壳，避免库里留下无效条目
+- 默认走 `quarantine`（移入隔离区，可恢复）；要真正删除文件需显式指定 `mode=purge`
+
+```json
+{
+  "guids": ["c0dcdebf3ba9451c92661adbe2546093"],
+  "mode": "quarantine"
+}
+```
+
 ### POST /music/api/v1/match/refresh-all-songs
 ### POST /music/api/v1/match/refresh-artist-covers
 ### POST /music/api/v1/match/refresh-album-covers
@@ -284,6 +331,8 @@ X-API-Key: <user_token.token>
 | `LYRIC_ROOT` | 歌词存放根目录 | `/var/apps/trim.music/meta/lyric` |
 | `COVER_ROOT` | 封面存放根目录 | `/var/apps/trim.music/meta/cover` |
 | `MUSIC_DB` | 飞牛音乐数据库 | `/usr/local/apps/@appdata/trim.music/db/music.db` |
+| `MUSIC_ROOT` | 音乐库根目录（音频文件所在），留空则从 `audio_file.path` 自动推导 | 自动推导 |
+| `QUARANTINE_ROOT` | 曲目清理的隔离区（可恢复），留空则用音乐库同级的 `.fnmusic-trash` | 音乐库同级 `.fnmusic-trash` |
 | `REFRESH_RAW_LOG_FILE` | 全量/多选任务原始 JSONL 日志 | `LOG_FILE` 同目录下 `refresh.raw.log` |
 | `QQ_HTTP_LOG_FILE` | QQ 请求人读摘要 | `LOG_FILE` 同目录下 `qq-http.log` |
 | `QQ_HTTP_RAW_LOG_FILE` | QQ 请求原始 JSONL 日志 | `LOG_FILE` 同目录下 `qq-http.raw.log` |
